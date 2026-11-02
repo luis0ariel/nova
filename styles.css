@@ -166,11 +166,16 @@ h3 { font-size: .85rem; color: var(--tenue); letter-spacing: .1em; text-transfor
 .ruta-item b { display: block; font-size: .9rem; }
 .ruta-item span small { display: block; margin-top: 3px; font-size: .72rem; }
 .chip { font-size: .66rem; padding: 3px 7px; border-radius: 4px; white-space: nowrap; border: 1px solid currentColor; letter-spacing: .04em; font-weight: 700; }
-.chip.verificada { color: var(--verde); }
+.chip.verificada, .chip.validada { color: var(--verde); }
+.chip.validacion { color: var(--cian); }
 .chip.rechazada { color: var(--rojo); }
-.chip.terminada { color: var(--azul); }
+.chip.terminada { color: var(--apagado); }
+.chip.pendiente_revision { color: var(--azul); }
 .chip.en-curso { color: var(--amarillo); }
 .chip.borrando { color: var(--rojo); border-style: dashed; }
+.chip.ok { color: var(--verde); }
+.chip.pausa { color: var(--amarillo); }
+.chip.alerta { color: var(--rojo); }
 .plain { padding-left: 18px; font-size: .85rem; color: var(--tenue); }
 .aviso-borrado {
   display: flex; justify-content: space-between; align-items: center; gap: 8px;
@@ -187,8 +192,16 @@ h3 { font-size: .85rem; color: var(--tenue); letter-spacing: .1em; text-transfor
 .estado-grande.pausa { color: var(--amarillo); border-color: var(--amarillo); }
 .estado-grande.alerta { color: var(--rojo); border-color: var(--rojo); box-shadow: 0 0 14px rgba(243, 139, 168, .25); }
 .revision { margin-top: 14px; }
+#d-enviar { width: 100%; margin-top: 14px; }
 .revision p { font-size: .85rem; }
 .revision .link { margin: 10px 0 0; }
+.comparacion { width: 100%; border-collapse: collapse; font-size: .78rem; margin: 8px 0; }
+.comparacion th, .comparacion td { padding: 5px 4px; border-bottom: 1px solid var(--borde); text-align: right; }
+.comparacion th { color: var(--apagado); font-weight: 400; }
+.comparacion th:first-child, .comparacion td:first-child { text-align: left; color: var(--tenue); }
+.comparacion td.bien { color: var(--verde); font-weight: 700; }
+.comparacion td.mal { color: var(--rojo); font-weight: 700; }
+.aviso-bien { border: 1px solid var(--verde); color: var(--verde); padding: 8px 10px; border-radius: 6px; }
 .controls.dos { grid-template-columns: 1fr 1fr; }
 .nota { background: var(--tarjeta); border-left: 3px solid var(--amarillo); padding: 8px 10px; border-radius: 4px; margin: 6px 0 0; color: var(--amarillo); }
 .contador { display: inline-block; min-width: 22px; padding: 1px 7px; border-radius: 4px; background: var(--oro); color: var(--oscuro); font-size: .72rem; text-align: center; }

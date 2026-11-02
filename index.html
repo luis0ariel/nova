@@ -89,10 +89,7 @@
       </div>
       <div class="extra">
         <button class="secondary" data-action="enviar-ubicacion">📤 Enviar mi ubicación al jefe</button>
-        <div class="fila-dos">
-          <button class="secondary" data-action="limite">⏰ Hora límite</button>
-          <button class="secondary" data-action="guardar-zona">⬇ Guardar mapa</button>
-        </div>
+        <button class="secondary" data-action="guardar-zona">⬇ Guardar mapa</button>
         <button class="secondary solo-pruebas" data-action="simular" id="btn-simular">▶ Simular recorrido de prueba</button>
         <p class="muted small">Mientras grabas, el mapa sigue tu posición y la pantalla se mantiene encendida. Toca 🔒 para moverlo libremente.</p>
       </div>
@@ -116,6 +113,7 @@
         <div class="stats" id="d-stats"></div>
         <h3>Paradas de descanso</h3>
         <ul id="d-paradas" class="plain"></ul>
+        <button class="primary" id="d-enviar" data-action="enviar-validacion" hidden>📤 Enviar a validación de experto</button>
         <div id="d-revision" class="card revision"></div>
         <div class="controls">
           <button class="secondary" data-action="renombrar">✎ Renombrar</button>
@@ -143,17 +141,26 @@
     <!-- ===== JEFE ===== -->
     <section id="tab-jefe" class="tab" data-roles="jefe dev">
       <h2 class="section-title">✦ JEFE</h2>
-      <p class="muted small">Con los datos guardados en este teléfono.</p>
+      <p class="muted small">Nova no tiene servidor: aquí ves a las personas que usan este mismo teléfono.</p>
       <div class="card">
-        <h2 id="j-nombre">Excursionista</h2>
+        <h2>✦ Monitoreo activo</h2>
+        <p class="muted small">Personas a tu cargo con ruta abierta o que compartieron su ubicación en las últimas 12 horas. Toca una para ver su detalle.</p>
+        <div id="j-personas"></div>
+      </div>
+      <div class="card" id="j-detalle" hidden>
+        <h2 id="j-nombre">—</h2>
         <div id="j-estado" class="estado-grande">—</div>
         <ul class="status">
-          <li><span>Última ubicación</span><b id="j-ubic">—</b></li>
+          <li><span>Ubicación</span><b id="j-ubic">—</b></li>
           <li><span>Actualizada</span><b id="j-hora">—</b></li>
-          <li><span>Hora límite</span><b id="j-limite">—</b></li>
+          <li><span>Batería</span><b id="j-bateria">—</b></li>
           <li><span>Ruta en curso</span><b id="j-ruta">—</b></li>
+          <li><span>Hora límite</span><b id="j-limite">—</b></li>
         </ul>
+        <button class="primary" data-action="jefe-limite">⏰ Hora límite de regreso</button>
         <div id="mapa-jefe"></div>
+        <h3>Perfil de emergencia</h3>
+        <ul class="status" id="j-salud"></ul>
       </div>
       <div class="card">
         <h2>Rutas del grupo</h2>
@@ -165,7 +172,7 @@
     <!-- ===== REVISAR (experto) ===== -->
     <section id="tab-revisar" class="tab" data-roles="exp dev">
       <h2 class="section-title">✦ REVISIÓN</h2>
-      <p class="muted small">Abre una ruta, revisa el recorrido y apruébala o recházala con una nota.</p>
+      <p class="muted small">Aquí llegan las rutas que los scouts envían desde Rutas. Abre una y haz el recorrido de validación. Si la distancia y el desnivel varían 15 % o menos, apruébala con fechas de vigencia y observaciones de seguridad. También puedes rechazarla con una nota.</p>
       <div class="card">
         <h2>Pendientes <span class="contador" id="r-n-pend">0</span></h2>
         <div id="r-pendientes"></div>

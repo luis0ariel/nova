@@ -5,7 +5,7 @@
  */
 'use strict';
 
-const VERSION_APP = 'v2.0.0';
+const VERSION_APP = 'v2.0.5';
 
 /* =========================================================
  * 1. Ajustes y utilidades
@@ -23,7 +23,7 @@ const VELOCIDAD_MAXIMA = 12;      // m/s; un salto más rápido es un error del 
 const UMBRAL_ALTITUD = 5;         // m; cambios menores no cuentan como subida
 const ZOOM_MAX_GUARDADO = 16;     // zoom máximo que se guarda para usar sin internet
 const LIMITE_MOSAICOS_ZONA = 1500;
-const CACHE_MAPA = 'ruta-segura-mapa';
+const CACHE_MAPA = 'nova-mapa';
 
 function distanciaMetros(a, b) {
   const R = 6371000;
@@ -171,7 +171,9 @@ const estado = {
   descansoActual: null,    // parada abierta { inicio, tipo, punto }
   horaLimite: null,        // timestamp
   avisoLimite: { previo: false, vencido: false },
-  sos: null,               // { activo, t, lat, lng }
+  sos: null,               // { activo, t, lat, lng, rol }
+  bateria: null,           // { nivel, cargando } de este teléfono
+  personaJefe: null,       // rol que el jefe tiene abierto en Monitoreo activo
   rutaAbierta: null,       // ruta mostrada en el detalle
   simulador: null,
   ultimoGuardado: 0,
@@ -187,21 +189,20 @@ const estado = {
  * Cada mosaico se busca en este orden y usa el primero que cargue:
  *   1. carpeta mapas/ (si existe; la crea descargar_mapa.py)
  *   2. OpenStreetMap (no se usa si la app se abre como archivo, porque lo bloquea)
- *   3. CARTO (respaldo, con datos de OpenStreetMap)
- *   4. el mismo lugar con menos zoom, ampliado (para ver algo sin internet)
+ *   3. el mismo lugar con menos zoom, ampliado (para ver algo sin internet)
  * El Service Worker guarda los mosaicos que ya se vieron.
  */
 const ABIERTA_COMO_ARCHIVO = location.protocol === 'file:';
 const MAPA_LOCAL = window.MAPA_LOCAL || null;
 const CENTRO_INICIAL = (MAPA_LOCAL && MAPA_LOCAL.centro) || [19.5800, -99.0700]; // Sierra de Guadalupe
 
-/* Mapa oscuro para el tema espacial. Los mosaicos claros (OpenStreetMap)
- * se oscurecen con un filtro CSS (clase "claro"). */
+/* Mapa oscuro para el tema espacial: los mosaicos de OpenStreetMap son claros
+ * y se oscurecen con un filtro CSS (clase "claro"). CARTO ya pide clave y no se usa. */
 const FUENTES = {
   local: (z, x, y) => `mapas/${z}/${x}/${y}.png`,
   osm: (z, x, y) => `https://tile.openstreetmap.org/${z}/${x}/${y}.png`,
-  carto: (z, x, y) => `https://${'abcd'[(x + y) % 4]}.basemaps.cartocdn.com/dark_all/${z}/${x}/${y}.png`,
 };
+// Carpetas mapas/ viejas (estilo "oscuro") ya vienen oscuras y no llevan filtro
 const LOCAL_OSCURO = !!(MAPA_LOCAL && MAPA_LOCAL.estilo === 'oscuro');
 
 function hayMosaicoLocal(z, x, y) {
@@ -212,7 +213,6 @@ function hayMosaicoLocal(z, x, y) {
 function urlsMosaico(z, x, y) {
   const urls = [];
   if (hayMosaicoLocal(z, x, y)) urls.push({ url: FUENTES.local(z, x, y), claro: !LOCAL_OSCURO });
-  urls.push({ url: FUENTES.carto(z, x, y), claro: false });
   if (!ABIERTA_COMO_ARCHIVO) urls.push({ url: FUENTES.osm(z, x, y), claro: true });
   return urls;
 }
@@ -259,7 +259,7 @@ const CapaMosaicos = L.GridLayer.extend({
 
 function crearMapa(id) {
   const mapa = L.map(id, { zoomControl: true, attributionControl: true }).setView(CENTRO_INICIAL, 14);
-  new CapaMosaicos({ maxZoom: 19, attribution: '&copy; OpenStreetMap &copy; CARTO' }).addTo(mapa);
+  new CapaMosaicos({ maxZoom: 19, attribution: '&copy; OpenStreetMap' }).addTo(mapa);
   return mapa;
 }
 
@@ -369,15 +369,12 @@ function mosaicosDeZona(limites, zMin, zMax) {
 }
 
 async function guardarMosaico(cache, z, x, y) {
-  const fuentes = ABIERTA_COMO_ARCHIVO ? [FUENTES.carto] : [FUENTES.carto, FUENTES.osm];
-  for (const fuente of fuentes) {
-    const url = fuente(z, x, y);
-    if (await cache.match(url, { ignoreVary: true })) return true;
-    try {
-      const resp = await fetch(url, { mode: 'cors' });
-      if (resp.ok) { await cache.put(url, resp); return true; }
-    } catch { /* se prueba la siguiente fuente */ }
-  }
+  const url = FUENTES.osm(z, x, y);
+  if (await cache.match(url, { ignoreVary: true })) return true;
+  try {
+    const resp = await fetch(url, { mode: 'cors' });
+    if (resp.ok) { await cache.put(url, resp); return true; }
+  } catch { /* sin internet o el servidor no respondió */ }
   return false;
 }
 
@@ -489,7 +486,7 @@ async function recibirPosicion(lat, lng, precision, t, alt = null) {
   // Última ubicación conocida, para la vista del jefe (cada 15 s como máximo)
   if (t - estado.ultimoGuardado > 15000) {
     estado.ultimoGuardado = t;
-    await DB.guardarAjuste('ultimaUbicacion', { lat, lng, precision, t });
+    await compartirUbicacion(estado.posicion);
     if (estado.grabacion) await DB.guardarRuta(estado.grabacion);
   }
 
@@ -512,6 +509,17 @@ async function recibirPosicion(lat, lng, precision, t, alt = null) {
 }
 
 /* Descanso automático: si en el último minuto te moviste menos de 15 m */
+/* Guarda la ubicación, batería y nombre para Monitoreo activo (vista del jefe).
+ * Se hace sola mientras la sesión está abierta y hay permiso de GPS.
+ * El jefe no se monitorea a sí mismo. */
+async function compartirUbicacion(p) {
+  if (!p || !Sesion.rol || Sesion.rol === 'jefe') return;
+  await DB.guardarAjuste('ultimaUbicacion', {
+    lat: p.lat, lng: p.lng, precision: p.precision, t: p.t,
+    rol: Sesion.rol, nombre: estado.perfil.nombre || '', bateria: estado.bateria,
+  });
+}
+
 function revisarDescansoAutomatico(t) {
   const ruta = estado.grabacion;
   const pos = [estado.posicion.lat, estado.posicion.lng];
@@ -591,8 +599,10 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     estado.ocultaDesde = Date.now();
     if (estado.grabacion) DB.guardarRuta(estado.grabacion);
+    compartirUbicacion(estado.posicion); // último punto conocido para el jefe
     return;
   }
+  compartirUbicacion(estado.posicion);
   if (estado.modo === 'grabando') {
     mantenerPantalla(true);
     const fuera = estado.ocultaDesde ? Date.now() - estado.ocultaDesde : 0;
@@ -601,6 +611,12 @@ document.addEventListener('visibilitychange', () => {
     }
   }
   estado.ocultaDesde = null;
+});
+
+// Al cerrar la app también se guarda el último punto conocido
+window.addEventListener('pagehide', () => {
+  if (estado.grabacion) DB.guardarRuta(estado.grabacion);
+  compartirUbicacion(estado.posicion);
 });
 
 /* =========================================================
@@ -617,7 +633,8 @@ function tiempoDescansos(ruta, ahora = Date.now()) {
   return total;
 }
 
-function iniciarRuta() {
+/* validar: ruta del scout que el experto recorre para validarla (opcional) */
+function iniciarRuta(validar = null) {
   if (estado.modo === 'grabando') return;
   iniciarGPS(); // por si se cerró la bienvenida sin dar permiso
   if (estado.modo === 'pausada') {
@@ -637,6 +654,11 @@ function iniciarRuta() {
     estado: 'en curso',
     autor: { rol: Sesion.rol, nombre: estado.perfil.nombre || '' },
   };
+  if (validar) {
+    estado.grabacion.validacionDe = validar.id;
+    estado.grabacion.nombre = `Validación: ${validar.nombre}`;
+    estado.grabacion.tipo = validar.tipo;
+  }
   estado.modo = 'grabando';
   estado.inicioTramo = ahora;
   estado.acumuladoMs = 0;
@@ -651,9 +673,10 @@ function iniciarRuta() {
     mapas.linea.addLatLng([p.lat, p.lng]);
   }
   DB.guardarRuta(estado.grabacion);
+  pintarGuia(estado.grabacion.validacionDe);
   mantenerPantalla(true);
   actualizarBotones();
-  aviso('Grabando ruta');
+  aviso(validar ? 'Grabando recorrido de validación' : 'Grabando ruta');
 }
 
 function pausarRuta() {
@@ -698,7 +721,7 @@ function terminarRuta() {
       ruta.tipo = $('#f-tipo').value;
       ruta.tiempos.fin = Date.now();
       ruta.tiempos.activoMs = estado.acumuladoMs;
-      ruta.estado = 'terminada';
+      ruta.estado = ruta.validacionDe ? 'validacion' : 'terminada';
       await DB.guardarRuta(ruta);
       detenerSimulador();
       estado.grabacion = null;
@@ -711,6 +734,7 @@ function terminarRuta() {
       if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
       actualizarBotones();
       await refrescarTodo();
+      if (ruta.validacionDe) { await terminarValidacion(ruta); return; }
       aviso('Ruta guardada');
       ofrecerInstalacion();
     } },
@@ -764,7 +788,8 @@ function actualizarPanelGrabar() {
     banner.textContent = `Grabando · señal de GPS débil (±${Math.round(estado.posicion.precision)} m)`;
     banner.className = 'banner pausa';
   } else {
-    banner.textContent = estado.simulador ? 'Grabando ruta (simulación)' : 'Grabando ruta';
+    banner.textContent = (ruta.validacionDe ? 'Grabando recorrido de validación' : 'Grabando ruta') +
+      (estado.simulador ? ' (simulación)' : '');
     banner.className = 'banner';
   }
 }
@@ -772,16 +797,24 @@ function actualizarPanelGrabar() {
 /* =========================================================
  * 8. Hora límite, alertas y SOS
  * ========================================================= */
+/* Solo el jefe (y dev) la define, desde Monitoreo activo. Se guarda en este
+ * teléfono (IndexedDB), así que las alertas le saltan al scout cuando entra. */
 function definirHoraLimite() {
+  if (!['jefe', 'dev'].includes(Sesion.rol)) return;
+  const quien = $('#j-nombre').textContent || 'la persona';
   const actual = estado.horaLimite ? new Date(estado.horaLimite).toTimeString().slice(0, 5) : '';
   abrirModal('Hora límite de regreso', `
-    <p class="muted small">Si a esta hora la ruta sigue abierta, la app te avisa y el jefe ve "retrasado". Te avisa también 15 minutos antes.</p>
+    <p class="small">Para <b>${escapar(quien)}</b>.</p>
+    <p class="muted small">Su teléfono le avisa 15 minutos antes y al llegar la hora si la ruta sigue abierta. Aquí aparecerá como "Retrasado".</p>
     <input type="time" id="f-limite" value="${actual}">`,
   [
     { texto: 'Quitar', clase: 'secondary', accion: async () => {
       estado.horaLimite = null;
+      estado.avisoLimite = { previo: false, vencido: false };
       await DB.guardarAjuste('horaLimite', null);
       refrescarInicio();
+      refrescarJefe();
+      aviso('Hora límite quitada');
     } },
     { texto: 'Guardar', clase: 'primary', accion: async () => {
       const valor = $('#f-limite').value;
@@ -797,6 +830,7 @@ function definirHoraLimite() {
         try { await Notification.requestPermission(); } catch { /* sin notificaciones */ }
       }
       refrescarInicio();
+      refrescarJefe();
       aviso(`Hora límite: ${formatoHora(estado.horaLimite)}`);
     } },
   ]);
@@ -804,6 +838,8 @@ function definirHoraLimite() {
 
 function revisarHoraLimite() {
   if (!estado.horaLimite || estado.modo === 'detenida') return;
+  // Las alertas son para quien camina; al jefe se le muestra en Monitoreo activo
+  if (!Sesion.rol || Sesion.rol === 'jefe') return;
   const falta = estado.horaLimite - Date.now();
   if (falta <= 15 * 60 * 1000 && falta > 0 && !estado.avisoLimite.previo) {
     estado.avisoLimite.previo = true;
@@ -1024,9 +1060,9 @@ function enviarUbicacion() {
 
 async function activarSOS() {
   const p = estado.posicion;
-  estado.sos = { activo: true, t: Date.now(), lat: p ? p.lat : null, lng: p ? p.lng : null };
+  estado.sos = { activo: true, t: Date.now(), lat: p ? p.lat : null, lng: p ? p.lng : null, rol: Sesion.rol };
   await DB.guardarAjuste('sos', estado.sos);
-  if (p) await DB.guardarAjuste('ultimaUbicacion', { lat: p.lat, lng: p.lng, precision: p.precision, t: p.t });
+  await compartirUbicacion(p);
   refrescarJefe();
 }
 
@@ -1039,8 +1075,50 @@ function chipEstado(ruta) {
     return `<span class="chip borrando">🗑 ${min} min</span>`;
   }
   const clase = ruta.estado === 'en curso' ? 'en-curso' : ruta.estado;
-  const texto = { verificada: '✓ verificada', rechazada: '✕ rechazada', terminada: 'por revisar' }[ruta.estado] || ruta.estado;
-  return `<span class="chip ${clase}">${escapar(texto)}</span>`;
+  return `<span class="chip ${clase}">${escapar(textoEstado(ruta.estado))}</span>`;
+}
+
+/* Estados de una ruta:
+ *   en curso → terminada (guardada, sin enviar) → pendiente_revision (enviada al experto)
+ *   → validada o rechazada. 'validacion' es el recorrido del experto.
+ *   'verificada' es de versiones anteriores (aprobada sin recorrido). */
+const TEXTO_ESTADO = {
+  'en curso': 'en curso', terminada: 'sin enviar', pendiente_revision: 'en revisión',
+  validada: '✓ validada', verificada: '✓ verificada', rechazada: '✕ rechazada',
+  validacion: 'recorrido de validación',
+};
+const textoEstado = (e) => TEXTO_ESTADO[e] || e;
+const PUEDE_ENVIARSE = ['terminada', 'rechazada'];
+
+/* Envío manual de una ruta guardada a la bandeja del experto */
+function enviarAValidacion() {
+  const ruta = estado.rutaAbierta;
+  if (!ruta || !PUEDE_ENVIARSE.includes(ruta.estado) || ruta.borrarEn) return;
+  const reenvio = ruta.estado === 'rechazada';
+  abrirModal('Enviar a validación de experto', `
+    <p><b>${escapar(ruta.nombre)}</b> · ${formatoKm(distanciaRuta(ruta.coordenadas))}</p>
+    <p class="small">La ruta pasa a la bandeja del experto. Él la recorre, la compara con la tuya y decide si la valida.</p>
+    ${reenvio ? '<p class="aviso-texto">Fue rechazada antes. Se borrarán la revisión y el recorrido de validación anteriores.</p>' : ''}`,
+  [
+    { texto: 'Cancelar', clase: 'secondary' },
+    { texto: '📤 Enviar', clase: 'primary', accion: async () => {
+      ruta.estado = 'pendiente_revision';
+      ruta.envio = { t: Date.now(), por: { rol: Sesion.rol, nombre: estado.perfil.nombre || '' } };
+      delete ruta.revision;
+      delete ruta.validacion;
+      await DB.guardarRuta(ruta);
+      await refrescarTodo();
+      abrirDetalle(ruta.id);
+      aviso('Ruta enviada al experto');
+    } },
+  ]);
+}
+
+function pintarEnvio(ruta) {
+  const boton = $('#d-enviar');
+  const mostrar = PUEDE_ENVIARSE.includes(ruta.estado) && !ruta.borrarEn;
+  boton.hidden = !mostrar;
+  boton.textContent = ruta.estado === 'rechazada' ? '📤 Volver a enviar a validación de experto' : '📤 Enviar a validación de experto';
 }
 
 async function refrescarLista() {
@@ -1063,12 +1141,13 @@ async function abrirDetalle(id) {
   if (!ruta) return;
   estado.rutaAbierta = ruta;
   pintarRevision(ruta);
+  pintarEnvio(ruta);
   pintarBorrado(ruta);
   $('#lista-envoltura').hidden = true;
   $('#detalle-ruta').hidden = false;
   $('#d-nombre').textContent = ruta.nombre;
   $('#d-meta').textContent = `${formatoFecha(ruta.tiempos.inicio)} · ${formatoHora(ruta.tiempos.inicio)}` +
-    (ruta.tiempos.fin ? ` a ${formatoHora(ruta.tiempos.fin)}` : '') + ` · ${ruta.tipo} · ${ruta.estado}` +
+    (ruta.tiempos.fin ? ` a ${formatoHora(ruta.tiempos.fin)}` : '') + ` · ${ruta.tipo} · ${textoEstado(ruta.estado)}` +
     (ruta.origen ? ` · importada (${ruta.origen})` : '');
 
   const dist = distanciaRuta(ruta.coordenadas);
@@ -1341,34 +1420,99 @@ function borrarTodo() {
 /* =========================================================
  * 11. Vista del jefe (simulada con datos locales)
  * ========================================================= */
-async function refrescarJefe() {
+const HORAS_MONITOREO = 12;
+const rolDe = (registro) => (registro && registro.rol) || 'scout'; // datos viejos no guardaban el rol
+
+/* Personas a cargo: quien tiene la ruta abierta, quien compartió su ubicación
+ * hace menos de 12 horas o quien activó el SOS en este teléfono. */
+async function personasMonitoreo(rutas) {
   const ultima = await DB.leerAjuste('ultimaUbicacion');
   const sos = await DB.leerAjuste('sos');
-  const rutas = await DB.todasLasRutas();
   const enCurso = rutas.find((r) => r.estado === 'en curso');
+  const ubic = ultima && Date.now() - ultima.t < HORAS_MONITOREO * 3600000 ? ultima : null;
+  const sosActivo = sos && sos.activo ? sos : null;
+  const roles = [...new Set([enCurso && rolDe(enCurso.autor), ubic && rolDe(ubic), sosActivo && rolDe(sosActivo)])]
+    .filter((rol) => rol && rol !== 'jefe' && ROLES[rol]);
+  return Promise.all(roles.map(async (rol) => ({
+    rol,
+    perfil: { ...PERFIL_VACIO, ...((await DB.leerAjuste(`perfil:${rol}`)) || {}) },
+    ubic: ubic && rolDe(ubic) === rol ? ubic : null,
+    ruta: enCurso && rolDe(enCurso.autor) === rol ? enCurso : null,
+    sos: sosActivo && rolDe(sosActivo) === rol ? sosActivo : null,
+  })));
+}
 
-  let texto = 'Sin ruta activa';
-  let clase = '';
-  if (sos && sos.activo) { texto = `🆘 SOS activo desde las ${formatoHora(sos.t)}`; clase = 'alerta'; }
-  else if (enCurso && estado.horaLimite && Date.now() > estado.horaLimite) { texto = '⚠ Retrasado'; clase = 'alerta'; }
-  else if (enCurso && estado.descansoActual) { texto = '⏸ En descanso'; clase = 'pausa'; }
-  else if (enCurso && estado.modo === 'pausada') { texto = '⏸ Ruta en pausa'; clase = 'pausa'; }
-  else if (enCurso) { texto = '🥾 En ruta'; clase = 'ok'; }
-  $('#j-nombre').textContent = estado.perfil.nombre || 'Excursionista';
-  const caja = $('#j-estado');
-  caja.textContent = texto;
-  caja.className = `estado-grande ${clase}`;
+function estadoPersona(p) {
+  if (p.sos) return { texto: `🆘 SOS activo desde las ${formatoHora(p.sos.t)}`, corto: '🆘 SOS', clase: 'alerta' };
+  if (p.ruta && estado.horaLimite && Date.now() > estado.horaLimite) return { texto: '⚠ Retrasado', corto: '⚠ retrasado', clase: 'alerta' };
+  if (p.ruta && estado.descansoActual) return { texto: '⏸ En descanso', corto: 'descanso', clase: 'pausa' };
+  if (p.ruta && estado.modo === 'pausada') return { texto: '⏸ Ruta en pausa', corto: 'en pausa', clase: 'pausa' };
+  if (p.ruta) return { texto: '🥾 En ruta', corto: 'en ruta', clase: 'ok' };
+  return { texto: 'Sin ruta activa', corto: 'sin ruta', clase: '' };
+}
 
-  $('#j-ubic').textContent = ultima ? `${ultima.lat.toFixed(5)}, ${ultima.lng.toFixed(5)}` : 'desconocida';
-  $('#j-hora').textContent = ultima ? `${formatoHora(ultima.t)} (${formatoHace(ultima.t)})` : '—';
-  $('#j-limite').textContent = estado.horaLimite
-    ? `${formatoHora(estado.horaLimite)}${Date.now() > estado.horaLimite ? ' · ya pasó' : ''}`
-    : 'sin definir';
-  $('#j-ruta').textContent = enCurso
-    ? `${formatoKm(distanciaRuta(enCurso.coordenadas))} · desde las ${formatoHora(enCurso.tiempos.inicio)}`
-    : 'ninguna';
+const nombrePersona = (p) => p.perfil.nombre || (p.ubic && p.ubic.nombre) || ROLES[p.rol].nombre;
+const textoBateria = (b) => (b && typeof b.nivel === 'number' ? `${b.nivel}%${b.cargando ? ' (cargando)' : ''}` : 'sin dato');
 
-  if (ultima && $('#tab-jefe').classList.contains('active')) {
+function itemPersona(p) {
+  const e = estadoPersona(p);
+  const detalle = [
+    `usuario: ${p.rol}`,
+    p.ubic ? `ubicación ${formatoHace(p.ubic.t)}` : 'sin ubicación',
+    p.ubic && p.ubic.bateria ? `BAT ${p.ubic.bateria.nivel}%` : '',
+  ].filter(Boolean).join(' · ');
+  return `
+    <button class="ruta-item" data-persona="${p.rol}">
+      <span><b>${ROLES[p.rol].icono} ${escapar(nombrePersona(p))}</b>
+      <small class="muted">${escapar(detalle)}</small></span>
+      <span class="chip ${e.clase}">${escapar(e.corto)}</span>
+    </button>`;
+}
+
+function lineasSaludPersona(perfil) {
+  const e = edad(perfil.nacimiento);
+  const tel = (n) => (n ? ` · <a href="tel:${escapar(limpiarTelefono(n))}">${escapar(n)}</a>` : '');
+  const filas = [
+    ['Edad', e !== null ? `${e} años` : ''],
+    ['Tipo de sangre', escapar(perfil.sangre)],
+    ['Alergias', escapar(perfil.alergias)],
+    ['Padecimientos', escapar(perfil.medico)],
+    ['Contacto de emergencia', perfil.emergNombre || perfil.emergTel ? `${escapar(perfil.emergNombre)}${tel(perfil.emergTel)}` : ''],
+    ['Jefe asignado', perfil.jefe || perfil.jefeTel ? `${escapar(perfil.jefe)}${tel(perfil.jefeTel)}` : ''],
+  ];
+  return filas.map(([k, v]) => `<li><span>${k}</span><b>${v || '<span class="muted">sin dato</span>'}</b></li>`).join('');
+}
+
+async function refrescarJefe() {
+  const rutas = await DB.todasLasRutas();
+  const personas = await personasMonitoreo(rutas);
+  if (!personas.some((p) => p.rol === estado.personaJefe)) estado.personaJefe = personas.length ? personas[0].rol : null;
+  $('#j-personas').innerHTML = personas.length ? personas.map(itemPersona).join('')
+    : '<p class="muted">Nadie comparte su ubicación ahora. Aparece aquí quien entre como scout con el GPS activado.</p>';
+
+  const p = personas.find((x) => x.rol === estado.personaJefe);
+  $('#j-detalle').hidden = !p;
+  if (p) {
+    const e = estadoPersona(p);
+    $('#j-nombre').textContent = `${ROLES[p.rol].icono} ${nombrePersona(p)}`;
+    const caja = $('#j-estado');
+    caja.textContent = e.texto;
+    caja.className = `estado-grande ${e.clase}`;
+    $('#j-ubic').textContent = p.ubic
+      ? `${p.ubic.lat.toFixed(5)}, ${p.ubic.lng.toFixed(5)} (±${Math.round(p.ubic.precision)} m)` : 'desconocida';
+    $('#j-hora').textContent = p.ubic ? `${formatoHora(p.ubic.t)} (${formatoHace(p.ubic.t)})` : '—';
+    $('#j-bateria').textContent = p.ubic ? textoBateria(p.ubic.bateria) : '—';
+    $('#j-ruta').textContent = p.ruta
+      ? `${formatoKm(distanciaRuta(p.ruta.coordenadas))} · desde las ${formatoHora(p.ruta.tiempos.inicio)}`
+      : 'ninguna';
+    $('#j-limite').textContent = estado.horaLimite
+      ? `${formatoHora(estado.horaLimite)}${Date.now() > estado.horaLimite ? ' · ya pasó' : ''}`
+      : 'sin definir';
+    $('#j-salud').innerHTML = lineasSaludPersona(p.perfil);
+  }
+
+  if (p && p.ubic && $('#tab-jefe').classList.contains('active')) {
+    const ultima = p.ubic;
     if (!mapas.jefe) {
       mapas.jefe = crearMapa('mapa-jefe');
       mapas.lineaJefe = L.polyline([], { color: '#ffd700', weight: 4 }).addTo(mapas.jefe);
@@ -1377,13 +1521,13 @@ async function refrescarJefe() {
     setTimeout(() => {
       mapas.jefe.invalidateSize();
       mapas.marcaJefe.setLatLng([ultima.lat, ultima.lng]);
-      mapas.lineaJefe.setLatLngs(enCurso ? enCurso.coordenadas.map((c) => [c[0], c[1]]) : []);
+      mapas.lineaJefe.setLatLngs(p.ruta ? p.ruta.coordenadas.map((c) => [c[0], c[1]]) : []);
       mapas.jefe.setView([ultima.lat, ultima.lng], 15);
     }, 50);
   }
 
   const cont = $('#j-rutas');
-  const terminadas = rutas.filter((r) => r.estado !== 'en curso');
+  const terminadas = rutas.filter((r) => r.estado !== 'en curso' && r.estado !== 'validacion');
   cont.innerHTML = terminadas.length ? terminadas.map((r) => itemRuta(r, true)).join('')
     : '<p class="muted">No hay rutas terminadas.</p>';
 }
@@ -1408,8 +1552,8 @@ function itemRuta(r, conAutor = false) {
 async function refrescarRevisar() {
   if (!Sesion.puede('exp dev')) return;
   const rutas = (await DB.todasLasRutas()).filter((r) => r.estado !== 'en curso');
-  const pendientes = rutas.filter((r) => r.estado === 'terminada');
-  const revisadas = rutas.filter((r) => r.estado !== 'terminada');
+  const pendientes = rutas.filter((r) => r.estado === 'pendiente_revision');
+  const revisadas = rutas.filter((r) => ['validada', 'verificada', 'rechazada'].includes(r.estado));
   $('#r-n-pend').textContent = pendientes.length;
   $('#r-pendientes').innerHTML = pendientes.length
     ? pendientes.map((r) => itemRuta(r, true)).join('')
@@ -1424,16 +1568,42 @@ function pintarRevision(ruta) {
   const rev = ruta.revision;
   if (ruta.estado === 'en curso') { caja.hidden = true; return; }
   caja.hidden = false;
+  if (ruta.estado === 'validacion') {
+    caja.innerHTML = '<h2>Recorrido de validación</h2><p class="muted">Lo grabó un experto para comparar la ruta de un scout. No se revisa.</p>';
+    return;
+  }
   let html = '<h2>Revisión</h2>';
-  if (rev) {
+  if (rev && rev.estado === 'validada') {
+    const vencida = rev.vigencia && fechaISO(new Date()) > rev.vigencia.fin;
+    html += `<p><b>✓ Validada</b> por ${escapar(rev.por)} el ${formatoFecha(rev.t)} a las ${formatoHora(rev.t)}</p>` +
+      `<p>Vigencia: <b>${fechaCorta(rev.vigencia.inicio)}</b> al <b>${fechaCorta(rev.vigencia.fin)}</b>${vencida ? ' <span class="chip rechazada">vencida</span>' : ''}</p>` +
+      `<p class="small">Observaciones y alertas de seguridad:</p><p class="nota">${escapar(rev.nota)}</p>` +
+      `<p class="muted small">Variación: distancia ${formatoPorcentaje(rev.variacion.distancia)}` +
+      `${rev.variacion.desnivel === null ? '' : `, desnivel ${formatoPorcentaje(rev.variacion.desnivel)}`}` +
+      ` · Firma ${escapar(String(rev.firma).slice(0, 19))}…</p>`;
+  } else if (rev) {
     html += `<p><b>${rev.estado === 'verificada' ? '✓ Aprobada' : '✕ Rechazada'}</b> por ${escapar(rev.por)} el ${formatoFecha(rev.t)} a las ${formatoHora(rev.t)}</p>` +
       (rev.nota ? `<p class="nota">“${escapar(rev.nota)}”</p>` : '');
+  } else if (ruta.estado === 'pendiente_revision') {
+    html += `<p class="muted">Enviada al experto${ruta.envio ? ` el ${formatoFecha(ruta.envio.t)} a las ${formatoHora(ruta.envio.t)}` : ''}. Pendiente de revisión.</p>`;
   } else {
-    html += '<p class="muted">Pendiente de revisión por un experto.</p>';
+    html += '<p class="muted">Sin enviar. Cuando quieras que un experto la valide, toca "Enviar a validación de experto".</p>';
   }
-  if (Sesion.puede('exp dev')) {
-    html += `<div class="controls dos">
-      <button class="primary" data-action="aprobar">✓ Aprobar</button>
+  if (ruta.validacion && !(rev && rev.estado === 'validada')) {
+    const v = ruta.validacion;
+    html += `<p class="small">Último recorrido de validación (${formatoFecha(v.t)}):</p>${tablaComparacion(v)}` +
+      (v.dentro ? '<p class="aviso-bien">Dentro de la tolerancia: se puede aprobar.</p>'
+        : `<p class="aviso-texto">⚠ La variación supera el ${v.tolerancia} %: no se puede aprobar.</p>`);
+  }
+  if (Sesion.puede('exp dev') && ruta.estado !== 'pendiente_revision') {
+    html += rev ? '<button class="link" data-action="quitar-revision">Quitar revisión</button>' : '';
+  } else if (Sesion.puede('exp dev')) {
+    const puedeAprobar = ruta.validacion && ruta.validacion.dentro && !(rev && rev.estado === 'validada');
+    html += `<div class="controls">
+      <button class="${puedeAprobar ? 'secondary' : 'primary'}" data-action="validar">🥾 Realizar recorrido de validación</button>
+    </div>
+    <div class="controls dos">
+      <button class="primary" data-action="aprobar"${puedeAprobar ? '' : ' disabled'}>✓ Aprobar</button>
       <button class="danger" data-action="rechazar">✕ Rechazar</button>
     </div>
     ${rev ? '<button class="link" data-action="quitar-revision">Quitar revisión</button>' : ''}`;
@@ -1472,12 +1642,204 @@ function revisarRuta(resultado) {
 async function quitarRevision() {
   const ruta = estado.rutaAbierta;
   if (!ruta || !Sesion.puede('exp dev')) return;
-  ruta.estado = 'terminada';
+  ruta.estado = 'pendiente_revision'; // vuelve a la bandeja del experto
   delete ruta.revision;
   await DB.guardarRuta(ruta);
   await refrescarTodo();
   abrirDetalle(ruta.id);
   aviso('Revisión quitada');
+}
+
+/* =========================================================
+ * 11b-2. Validación de rutas (experto)
+ * =========================================================
+ * El experto recorre la ruta del scout. Al terminar, Nova compara la
+ * distancia total y el desnivel (subida acumulada). Si ninguno varía más
+ * de TOLERANCIA_VALIDACION %, se habilita el formulario de aprobación.
+ */
+const TOLERANCIA_VALIDACION = 15; // %
+
+const tieneAltitud = (coords) => coords.some((c) => c[3] !== null && c[3] !== undefined);
+const formatoPorcentaje = (n) => `${n.toFixed(1)} %`;
+const quienFirma = () => (estado.perfil.nombre
+  ? `${estado.perfil.nombre} (${ROLES[Sesion.rol].nombre})` : ROLES[Sesion.rol].nombre);
+
+/* Diferencia relativa respecto al valor original, en % */
+function variacionPorcentaje(original, real) {
+  if (original === 0) return real === 0 ? 0 : 100;
+  return (Math.abs(real - original) / original) * 100;
+}
+
+/* Compara la ruta original del scout con el recorrido real del experto.
+ * Si alguna de las dos no tiene altitud, el desnivel no se puede comparar
+ * y se decide solo con la distancia. */
+function compararRecorridos(original, recorrido) {
+  const dOriginal = distanciaRuta(original.coordenadas);
+  const dReal = distanciaRuta(recorrido.coordenadas);
+  const conAltitud = tieneAltitud(original.coordenadas) && tieneAltitud(recorrido.coordenadas);
+  const distancia = { original: dOriginal, real: dReal, variacion: variacionPorcentaje(dOriginal, dReal) };
+  let desnivel = null;
+  if (conAltitud) {
+    const sOriginal = datosAltitud(original.coordenadas).subida;
+    const sReal = datosAltitud(recorrido.coordenadas).subida;
+    desnivel = { original: sOriginal, real: sReal, variacion: variacionPorcentaje(sOriginal, sReal) };
+  }
+  const dentro = distancia.variacion <= TOLERANCIA_VALIDACION &&
+    (!desnivel || desnivel.variacion <= TOLERANCIA_VALIDACION);
+  return {
+    recorridoId: recorrido.id,
+    t: Date.now(),
+    por: { rol: Sesion.rol, nombre: estado.perfil.nombre || '' },
+    tolerancia: TOLERANCIA_VALIDACION,
+    distancia,
+    desnivel,
+    dentro,
+  };
+}
+
+/* Huella SHA-256 que sirve de firma de la aprobación */
+async function huellaTexto(texto) {
+  if (window.crypto && crypto.subtle) {
+    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(texto));
+    return 'sha256:' + [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  let h = 2166136261;
+  for (let i = 0; i < texto.length; i++) { h ^= texto.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return 'fnv:' + (h >>> 0).toString(16);
+}
+
+/* Ruta original punteada en el mapa de Grabar, para seguirla */
+async function pintarGuia(rutaId) {
+  const original = rutaId ? await DB.leerRuta(rutaId) : null;
+  const mapa = mapaGrabar();
+  if (!mapas.guia) mapas.guia = L.polyline([], { color: '#89dceb', weight: 4, opacity: 0.7, dashArray: '6 8' });
+  if (!original) { mapas.guia.remove(); return; }
+  mapas.guia.setLatLngs(original.coordenadas.map((c) => [c[0], c[1]])).addTo(mapa);
+  mapas.linea.bringToFront();
+}
+
+function iniciarValidacion() {
+  const ruta = estado.rutaAbierta;
+  if (!ruta || !Sesion.puede('exp dev')) return;
+  if (ruta.estado !== 'pendiente_revision') { aviso('Esta ruta no se ha enviado a validación'); return; }
+  if (estado.modo !== 'detenida') { aviso('Termina primero la ruta que estás grabando'); return; }
+  if (ruta.coordenadas.length < 2) { aviso('La ruta no tiene puntos para comparar'); return; }
+  const alt = datosAltitud(ruta.coordenadas);
+  abrirModal('Recorrido de validación', `
+    <p><b>${escapar(ruta.nombre)}</b> · ${formatoKm(distanciaRuta(ruta.coordenadas))}` +
+    `${tieneAltitud(ruta.coordenadas) ? ` · subida ${Math.round(alt.subida)} m` : ''}</p>
+    <p class="small">Recorre la ruta con Nova grabando. La ruta del scout se ve punteada en el mapa.</p>
+    <p class="muted small">Al terminar se comparan la distancia total y el desnivel. Si ninguno varía más de ${TOLERANCIA_VALIDACION} %, podrás llenar el formulario de aprobación.</p>`,
+  [
+    { texto: 'Cancelar', clase: 'secondary' },
+    { texto: '🥾 Empezar', clase: 'primary', accion: () => { irATab('grabar'); iniciarRuta(ruta); } },
+  ]);
+}
+
+/* Se llama al guardar el recorrido del experto */
+async function terminarValidacion(recorrido) {
+  pintarGuia(null);
+  const original = await DB.leerRuta(recorrido.validacionDe);
+  if (!original) { aviso('No se encontró la ruta original'); return; }
+  original.validacion = compararRecorridos(original, recorrido);
+  await DB.guardarRuta(original);
+  await refrescarTodo();
+  irATab('rutas');
+  estado.volverA = 'revisar';
+  await abrirDetalle(original.id);
+  mostrarComparacion(original);
+}
+
+function tablaComparacion(v) {
+  const celda = (n) => `<td class="${n <= v.tolerancia ? 'bien' : 'mal'}">${formatoPorcentaje(n)}</td>`;
+  return `
+    <table class="comparacion">
+      <tr><th></th><th>Scout</th><th>Experto</th><th>Variación</th></tr>
+      <tr><td>Distancia</td><td>${formatoKm(v.distancia.original)}</td><td>${formatoKm(v.distancia.real)}</td>${celda(v.distancia.variacion)}</tr>
+      ${v.desnivel
+        ? `<tr><td>Desnivel</td><td>${Math.round(v.desnivel.original)} m</td><td>${Math.round(v.desnivel.real)} m</td>${celda(v.desnivel.variacion)}</tr>`
+        : '<tr><td>Desnivel</td><td colspan="3" class="muted">Sin datos de altitud: no se compara</td></tr>'}
+    </table>`;
+}
+
+function mostrarComparacion(ruta) {
+  const v = ruta.validacion;
+  if (!v) return;
+  if (v.dentro) {
+    abrirModal('✓ Recorrido dentro de la tolerancia', `
+      ${tablaComparacion(v)}
+      <p class="aviso-bien">La variación es de ${v.tolerancia} % o menos. Ya puedes aprobar la ruta.</p>`,
+    [
+      { texto: 'Después', clase: 'secondary' },
+      { texto: 'Formulario de aprobación', clase: 'primary', accion: () => formularioAprobacion() },
+    ]);
+  } else {
+    abrirModal('⚠ La variación supera el 15 %', `
+      ${tablaComparacion(v)}
+      <p class="aviso-texto">El recorrido real no coincide con la ruta del scout. <b>No se puede aprobar.</b> Revisa el trazo con el scout o vuelve a hacer el recorrido de validación.</p>`,
+    [
+      { texto: 'Cerrar', clase: 'secondary' },
+      { texto: '✕ Rechazar ruta', clase: 'danger', accion: () => revisarRuta('rechazada') },
+    ]);
+  }
+}
+
+const fechaISO = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const fechaCorta = (iso) => new Date(`${iso}T12:00:00`).toLocaleDateString('es-MX', { day: 'numeric', month: 'short', year: 'numeric' });
+
+function formularioAprobacion(previo = null) {
+  const ruta = estado.rutaAbierta;
+  if (!ruta || !Sesion.puede('exp dev')) return;
+  if (ruta.estado !== 'pendiente_revision') { aviso('Esta ruta no se ha enviado a validación'); return; }
+  if (!ruta.validacion || !ruta.validacion.dentro) { aviso('Primero haz un recorrido de validación dentro de la tolerancia'); return; }
+  const hoy = new Date();
+  const enUnAnio = new Date(hoy.getFullYear() + 1, hoy.getMonth(), hoy.getDate());
+  const p = previo || { inicio: fechaISO(hoy), fin: fechaISO(enUnAnio), obs: '' };
+  abrirModal('Aprobar ruta', `
+    <p><b>${escapar(ruta.nombre)}</b></p>
+    ${tablaComparacion(ruta.validacion)}
+    <div class="fila-dos">
+      <label>Vigente desde<input type="date" id="f-vig-inicio" value="${p.inicio}" required></label>
+      <label>Vigente hasta<input type="date" id="f-vig-fin" value="${p.fin}" required></label>
+    </div>
+    <label>Observaciones y alertas de seguridad
+      <textarea id="f-obs" maxlength="600" required placeholder="Ej. Piedra suelta después del km 2. Llevar 2 litros de agua. No subir con lluvia.">${escapar(p.obs)}</textarea>
+    </label>
+    <p class="muted small">Se firma con tu usuario: ${escapar(quienFirma())}.</p>`,
+  [
+    { texto: 'Cancelar', clase: 'secondary' },
+    { texto: '✓ Aprobar', clase: 'primary', accion: async () => {
+      const datos = { inicio: $('#f-vig-inicio').value, fin: $('#f-vig-fin').value, obs: $('#f-obs').value.trim() };
+      let error = '';
+      if (!datos.inicio || !datos.fin) error = 'Escribe las dos fechas de vigencia';
+      else if (datos.fin < datos.inicio) error = 'La fecha final debe ser después de la inicial';
+      else if (!datos.obs) error = 'Escribe las observaciones y alertas de seguridad';
+      if (error) { aviso(error); formularioAprobacion(datos); return; }
+      await aprobarRuta(ruta, datos);
+    } },
+  ]);
+}
+
+async function aprobarRuta(ruta, datos) {
+  const v = ruta.validacion;
+  const revision = {
+    estado: 'validada',
+    nota: datos.obs,
+    vigencia: { inicio: datos.inicio, fin: datos.fin },
+    experto: { rol: Sesion.rol, nombre: estado.perfil.nombre || '' },
+    por: quienFirma(),
+    t: Date.now(),
+    recorridoId: v.recorridoId,
+    variacion: { distancia: v.distancia.variacion, desnivel: v.desnivel ? v.desnivel.variacion : null },
+  };
+  revision.firma = await huellaTexto(JSON.stringify([ruta.id, revision.estado, revision.vigencia,
+    revision.nota, revision.experto, revision.t, revision.recorridoId]));
+  ruta.estado = 'validada';
+  ruta.revision = revision;
+  await DB.guardarRuta(ruta);
+  await refrescarTodo();
+  abrirDetalle(ruta.id);
+  aviso('Ruta validada ✓');
 }
 
 /* =========================================================
@@ -1504,7 +1866,7 @@ async function refrescarAdmin() {
   $('#a-sistema').innerHTML = `
     <li><span>Versión</span><b>${VERSION_APP}</b></li>
     <li><span>Rutas guardadas</span><b>${rutas.length}</b></li>
-    <li><span>Pendientes de revisión</span><b>${rutas.filter((r) => r.estado === 'terminada').length}</b></li>
+    <li><span>Pendientes de revisión</span><b>${rutas.filter((r) => r.estado === 'pendiente_revision').length}</b></li>
     <li><span>Espacio usado</span><b>${uso}</b></li>
     <li><span>Abierta como</span><b>${ABIERTA_COMO_ARCHIVO ? 'archivo' : location.host}</b></li>`;
 }
@@ -1710,6 +2072,7 @@ async function leerBateria() {
     const b = await navigator.getBattery();
     const pintar = () => {
       const n = Math.round(b.level * 100);
+      estado.bateria = { nivel: n, cargando: b.charging };
       hud('bat', `BAT ${n}%${b.charging ? '+' : ''}`, n <= 15 ? 'mal' : n <= 30 ? 'medio' : 'info');
     };
     pintar();
@@ -1835,12 +2198,13 @@ const acciones = {
   'terminar': terminarRuta,
   'centrar': centrarMapa,
   'guardar-zona': guardarZona,
-  'limite': definirHoraLimite,
+  'jefe-limite': definirHoraLimite,
   'sos': abrirSOS,
   'simular': iniciarSimulador,
   'volver-lista': volverDeDetalle,
   'cuenta': menuCuenta,
-  'aprobar': () => revisarRuta('verificada'),
+  'aprobar': () => formularioAprobacion(),
+  'validar': iniciarValidacion,
   'rechazar': () => revisarRuta('rechazada'),
   'quitar-revision': quitarRevision,
   'restablecer-claves': restablecerClaves,
@@ -1857,6 +2221,7 @@ const acciones = {
   'borrar-todo': borrarTodo,
   'instalar': () => instalarApp(),
   'enviar-ubicacion': enviarUbicacion,
+  'enviar-validacion': enviarAValidacion,
 };
 
 document.addEventListener('click', (e) => {
@@ -1867,6 +2232,12 @@ document.addEventListener('click', (e) => {
   const accion = e.target.closest('[data-action]');
   if (accion && accion.dataset.action === 'cambiar-clave') return cambiarClave(accion.dataset.rol);
   if (accion && acciones[accion.dataset.action]) return acciones[accion.dataset.action]();
+  const persona = e.target.closest('[data-persona]');
+  if (persona) {
+    estado.personaJefe = persona.dataset.persona;
+    refrescarJefe().then(() => $('#j-detalle').scrollIntoView({ behavior: 'smooth', block: 'start' }));
+    return;
+  }
   const ruta = e.target.closest('[data-ruta]');
   if (ruta) {
     const actual = document.querySelector('.tab.active').id.replace('tab-', '');
@@ -1951,6 +2322,7 @@ async function arrancar() {
     estado.acumuladoMs = pendiente.tiempos.activoMs || 0;
     mapaGrabar();
     mapas.linea.setLatLngs(pendiente.coordenadas.map((c) => [c[0], c[1]]));
+    if (pendiente.validacionDe) pintarGuia(pendiente.validacionDe);
     aviso('Se recuperó una ruta sin terminar (en pausa). Pulsa Reanudar para seguir.', 5000);
   }
 
@@ -1970,8 +2342,8 @@ async function arrancar() {
   // Borrados programados (1 hora) y estado
   procesarBorrados();
   setInterval(() => { procesarBorrados(); pintarHud(); }, 30000);
-  // La vista del jefe se actualiza sola cada 20 s
-  setInterval(() => { if ($('#tab-jefe').classList.contains('active')) refrescarJefe(); }, 20000);
+  // La vista del jefe se actualiza sola cada 10 s
+  setInterval(() => { if ($('#tab-jefe').classList.contains('active')) refrescarJefe(); }, 10000);
 
   if ('serviceWorker' in navigator && !ABIERTA_COMO_ARCHIVO) {
     const habiaControlador = !!navigator.serviceWorker.controller;

@@ -31,9 +31,9 @@ LIMITE = 2500                  # máximo de mosaicos por descarga
 PAUSA = 0.3                    # segundos entre mosaicos
 AGENTE = "Nova/2.0 (proyecto escolar CECyT 3 IPN; descarga para uso sin internet)"
 
-# Mapa oscuro (tema espacial de Nova); OpenStreetMap como respaldo
+# OpenStreetMap (claro); la app lo oscurece con un filtro CSS.
+# CARTO ya pide clave y devuelve una imagen con "API KEY REQUIRED", así que no se usa.
 FUENTES = [
-    "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
     "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
 ]
 
@@ -92,7 +92,7 @@ def escribir_indice(lat, lng, rangos, total):
         "zMax": ZOOM_MAX,
         "rangos": {str(z): r for z, r in rangos.items()},
         "total": total,
-        "estilo": "oscuro",
+        "estilo": "claro",
         "creado": time.strftime("%Y-%m-%d %H:%M"),
     }
     with open(os.path.join(CARPETA, "indice.js"), "w", encoding="utf-8") as archivo:

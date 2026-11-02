@@ -3,9 +3,10 @@
  * - Guarda los mosaicos del mapa que ya viste (y las zonas que guardes), para verlos sin internet.
  * Cambia VERSION cada vez que modifiques archivos de la app.
  */
-const VERSION = 'v2.0.0';
+const VERSION = 'v2.0.5';
 const CACHE_APP = `ruta-segura-app-${VERSION}`;
-const CACHE_MAPA = 'ruta-segura-mapa';
+const CACHE_MAPA = 'nova-mapa';
+const CACHE_MAPA_VIEJA = 'ruta-segura-mapa'; // tiene mosaicos de CARTO con la marca "API KEY REQUIRED"
 const CACHE_LOCAL = 'ruta-segura-local'; // archivos de la carpeta mapas/ y otros del mismo sitio
 const MAX_MOSAICOS = 6000;
 
@@ -27,7 +28,7 @@ const ARCHIVOS_APP = [
   'vendor/leaflet/images/layers-2x.png',
 ];
 
-const HOSTS_MAPA = ['tile.openstreetmap.org', 'basemaps.cartocdn.com'];
+const HOSTS_MAPA = ['tile.openstreetmap.org'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE_APP).then((c) => c.addAll(ARCHIVOS_APP)).then(() => self.skipWaiting()));
@@ -37,7 +38,7 @@ self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches.keys()
       .then((nombres) => Promise.all(nombres
-        .filter((n) => n.startsWith('ruta-segura-app-') && n !== CACHE_APP)
+        .filter((n) => (n.startsWith('ruta-segura-app-') && n !== CACHE_APP) || n === CACHE_MAPA_VIEJA)
         .map((n) => caches.delete(n))))
       .then(() => self.clients.claim())
   );
