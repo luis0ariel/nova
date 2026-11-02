@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0d0d1a">
+  <meta name="description" content="Nova: registra rutas de senderismo con GPS, sin internet.">
+  <title>Nova</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="sin-sesion">
+
+  <!-- ===== INICIO DE SESIÓN Y REGISTRO ===== -->
+  <div id="login" class="login">
+    <div class="cielo" aria-hidden="true"></div>
+    <div class="login-caja">
+      <div class="logo-nova"><span class="estrella">✦</span> NOVA</div>
+
+      <!-- Paso 1: elegir usuario -->
+      <div id="paso-roles" class="paso">
+        <p class="login-sub">¿QUIÉN ERES?</p>
+        <div class="roles" id="l-roles"></div>
+      </div>
+
+      <!-- Paso 2: contraseña -->
+      <div id="paso-pin" class="paso" hidden>
+        <div class="rol-elegido" id="l-rol"></div>
+        <div class="pin" id="l-puntos" aria-live="polite"></div>
+        <p id="l-error" class="login-error" hidden>Contraseña incorrecta</p>
+        <div class="teclado" id="l-teclado"></div>
+        <button class="link" type="button" data-login="volver">← Cambiar de usuario</button>
+      </div>
+
+      <!-- Paso 3: datos la primera vez -->
+      <div id="paso-registro" class="paso" hidden>
+        <p class="login-sub">✦ TU PERFIL DE SEGURIDAD</p>
+        <p class="muted small">Es tu primera vez como <b id="l-rol-registro"></b>. Estos datos se usan en el SOS y solo se guardan en este teléfono. Puedes cambiarlos después en <b>Perfil</b>.</p>
+        <div id="registro-destino"></div>
+        <p class="muted small">Al entrar, el navegador te pedirá tu <b>ubicación</b> para dibujar tus rutas.</p>
+      </div>
+
+      <p class="muted small login-pie" id="l-pie"></p>
+    </div>
+  </div>
+
+  <!-- ===== BARRA SUPERIOR ===== -->
+  <header class="topbar">
+    <div class="brand"><span class="estrella">✦</span> NOVA</div>
+    <button class="usuario-btn" data-action="cuenta" id="btn-cuenta">—</button>
+    <button class="sos-btn" data-action="sos" aria-label="Enviar SOS">SOS</button>
+  </header>
+  <!-- Estado discreto, como el contador de FPS de un juego -->
+  <div class="hud" id="hud" data-action="hud" title="Estado">
+    <span id="h-gps">GPS --</span>
+    <span id="h-net">NET --</span>
+    <span id="h-bat">BAT --</span>
+    <span id="h-mapa">MAP --</span>
+    <span id="h-limite" hidden></span>
+  </div>
+
+  <main>
+    <!-- ===== GRABAR (inicio) ===== -->
+    <section id="tab-grabar" class="tab active">
+      <div class="mapa-envoltura">
+        <div id="mapa"></div>
+        <div class="mapa-botones">
+          <button id="btn-bloqueo" data-action="bloqueo" aria-label="Bloquear o desbloquear el mapa" title="Bloquear mapa">🔒</button>
+          <button data-action="ver-ruta" aria-label="Ver toda la ruta" title="Ver toda la ruta">⤢</button>
+          <button data-action="centrar" aria-label="Centrar en mi posición" title="Centrar">◎</button>
+        </div>
+      </div>
+      <div class="stats">
+        <div><small>TIEMPO</small><b id="g-tiempo">00:00:00</b></div>
+        <div><small>DISTANCIA</small><b id="g-dist">0.00 km</b></div>
+        <div><small>RITMO</small><b id="g-ritmo">--:-- /km</b></div>
+        <div><small>DESCANSOS</small><b id="g-paradas">0</b></div>
+      </div>
+      <div id="g-estado" class="banner">Listo para iniciar</div>
+      <div class="controls">
+        <button class="primary" id="btn-iniciar" data-action="iniciar">▶ Iniciar</button>
+        <button class="secondary" id="btn-pausar" data-action="pausar" disabled>❚❚ Pausar</button>
+        <button class="secondary" id="btn-descanso" data-action="descanso" disabled>Descanso</button>
+        <button class="danger" id="btn-terminar" data-action="terminar" disabled>■ Terminar</button>
+      </div>
+      <div class="extra">
+        <button class="secondary" data-action="enviar-ubicacion">📤 Enviar mi ubicación al jefe</button>
+        <div class="fila-dos">
+          <button class="secondary" data-action="limite">⏰ Hora límite</button>
+          <button class="secondary" data-action="guardar-zona">⬇ Guardar mapa</button>
+        </div>
+        <button class="secondary solo-pruebas" data-action="simular" id="btn-simular">▶ Simular recorrido de prueba</button>
+        <p class="muted small">Mientras grabas, el mapa sigue tu posición y la pantalla se mantiene encendida. Toca 🔒 para moverlo libremente.</p>
+      </div>
+    </section>
+
+    <!-- ===== MIS RUTAS ===== -->
+    <section id="tab-rutas" class="tab">
+      <div id="lista-envoltura">
+        <div class="titulo-fila">
+          <h2 class="section-title">✦ MIS RUTAS</h2>
+          <button class="link" data-action="importar">📂 Importar</button>
+        </div>
+        <div id="lista-rutas"></div>
+      </div>
+      <div id="detalle-ruta" hidden>
+        <button class="link" data-action="volver-lista">← Volver</button>
+        <h2 id="d-nombre"></h2>
+        <p class="muted small" id="d-meta"></p>
+        <div id="d-borrado" class="aviso-borrado" hidden></div>
+        <div id="mapa-detalle"></div>
+        <div class="stats" id="d-stats"></div>
+        <h3>Paradas de descanso</h3>
+        <ul id="d-paradas" class="plain"></ul>
+        <div id="d-revision" class="card revision"></div>
+        <div class="controls">
+          <button class="secondary" data-action="renombrar">✎ Renombrar</button>
+          <button class="secondary" data-action="exportar">⇩ Exportar</button>
+          <button class="secondary solo-pruebas" data-action="repetir">▶ Repetir como demo</button>
+          <button class="danger" data-action="eliminar" id="btn-eliminar">🗑 Borrar</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== PERFIL ===== -->
+    <section id="tab-perfil" class="tab">
+      <h2 class="section-title">✦ PERFIL</h2>
+      <div class="card">
+        <div id="perfil-destino"></div>
+      </div>
+      <div class="card">
+        <h2>Sesión</h2>
+        <ul class="status" id="pf-sesion"></ul>
+        <button class="secondary" data-action="instalar" id="btn-instalar" hidden>📲 Instalar como app</button>
+        <button class="danger ancho" data-action="cerrar-sesion">Cerrar sesión</button>
+      </div>
+    </section>
+
+    <!-- ===== JEFE ===== -->
+    <section id="tab-jefe" class="tab" data-roles="jefe dev">
+      <h2 class="section-title">✦ JEFE</h2>
+      <p class="muted small">Con los datos guardados en este teléfono.</p>
+      <div class="card">
+        <h2 id="j-nombre">Excursionista</h2>
+        <div id="j-estado" class="estado-grande">—</div>
+        <ul class="status">
+          <li><span>Última ubicación</span><b id="j-ubic">—</b></li>
+          <li><span>Actualizada</span><b id="j-hora">—</b></li>
+          <li><span>Hora límite</span><b id="j-limite">—</b></li>
+          <li><span>Ruta en curso</span><b id="j-ruta">—</b></li>
+        </ul>
+        <div id="mapa-jefe"></div>
+      </div>
+      <div class="card">
+        <h2>Rutas del grupo</h2>
+        <p class="muted small">Las aprueba o rechaza un experto.</p>
+        <div id="j-rutas"></div>
+      </div>
+    </section>
+
+    <!-- ===== REVISAR (experto) ===== -->
+    <section id="tab-revisar" class="tab" data-roles="exp dev">
+      <h2 class="section-title">✦ REVISIÓN</h2>
+      <p class="muted small">Abre una ruta, revisa el recorrido y apruébala o recházala con una nota.</p>
+      <div class="card">
+        <h2>Pendientes <span class="contador" id="r-n-pend">0</span></h2>
+        <div id="r-pendientes"></div>
+      </div>
+      <div class="card">
+        <h2>Revisadas</h2>
+        <div id="r-revisadas"></div>
+      </div>
+    </section>
+
+    <!-- ===== ADMIN (dev) ===== -->
+    <section id="tab-admin" class="tab" data-roles="dev">
+      <h2 class="section-title">✦ ADMIN</h2>
+      <div class="card">
+        <h2>Contraseñas</h2>
+        <p class="muted small">Cambia la contraseña de cada tipo de usuario. La predeterminada es 0000.</p>
+        <div id="a-claves"></div>
+        <button class="link" data-action="restablecer-claves">Restablecer todas a 0000</button>
+      </div>
+      <div class="card">
+        <h2>Pruebas</h2>
+        <label class="interruptor"><input type="checkbox" id="p-pruebas"> Modo pruebas (simulador y "Repetir como demo")</label>
+        <p class="muted small">Con el modo pruebas activo, el botón "Simular recorrido" aparece en Grabar.</p>
+      </div>
+      <div class="card">
+        <h2>Sistema</h2>
+        <ul class="status" id="a-sistema"></ul>
+        <button class="link peligro" data-action="borrar-todo">Borrar todos los datos</button>
+      </div>
+    </section>
+  </main>
+
+  <nav class="tabbar">
+    <button data-tab="grabar" class="active"><span>⏺</span>Grabar</button>
+    <button data-tab="rutas"><span>🗂</span>Rutas</button>
+    <button data-tab="perfil"><span>👤</span>Perfil</button>
+    <button data-tab="jefe" data-roles="jefe dev"><span>🧭</span>Jefe</button>
+    <button data-tab="revisar" data-roles="exp dev"><span>✅</span>Revisar</button>
+    <button data-tab="admin" data-roles="dev"><span>🛠</span>Admin</button>
+  </nav>
+
+  <!-- Formulario de perfil: se muestra en el registro y en la pestaña Perfil -->
+  <form id="form-perfil" class="form-perfil" autocomplete="off">
+    <fieldset>
+      <legend>Datos personales</legend>
+      <label class="campo">Nombre completo *<input name="nombre" maxlength="60" required placeholder="Ej. Luis Ariel Fernández"></label>
+      <div class="fila-dos">
+        <label class="campo">Fecha de nacimiento<input name="nacimiento" type="date"></label>
+        <label class="campo">Tipo de sangre
+          <select name="sangre">
+            <option value="">No sé</option>
+            <option>O+</option><option>O-</option><option>A+</option><option>A-</option>
+            <option>B+</option><option>B-</option><option>AB+</option><option>AB-</option>
+          </select>
+        </label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Salud</legend>
+      <label class="campo">Alergias<input name="alergias" maxlength="120" placeholder="Ej. penicilina, picaduras de abeja (o ninguna)"></label>
+      <label class="campo">Padecimientos y medicamentos<textarea name="medico" maxlength="300" placeholder="Ej. asma, uso inhalador"></textarea></label>
+    </fieldset>
+    <fieldset>
+      <legend>Contacto de emergencia</legend>
+      <div class="fila-dos">
+        <label class="campo">Nombre<input name="emergNombre" maxlength="40" placeholder="Ej. mamá"></label>
+        <label class="campo">Teléfono<input name="emergTel" type="tel" inputmode="tel" maxlength="20" placeholder="5512345678"></label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Jefe de la salida</legend>
+      <div class="fila-dos">
+        <label class="campo">Nombre<input name="jefe" maxlength="40" placeholder="Ej. Jefe de grupo"></label>
+        <label class="campo">Teléfono<input name="jefeTel" type="tel" inputmode="tel" maxlength="20" placeholder="5512345678"></label>
+      </div>
+    </fieldset>
+    <button class="primary big" type="submit" id="pf-guardar">Guardar perfil</button>
+  </form>
+
+  <!-- Ventana emergente genérica -->
+  <dialog id="modal">
+    <form method="dialog">
+      <h2 id="m-titulo"></h2>
+      <div id="m-cuerpo"></div>
+      <div class="controls" id="m-botones"></div>
+    </form>
+  </dialog>
+
+  <input type="file" id="f-importar" accept=".gpx,.json,application/gpx+xml,application/json" multiple hidden>
+  <div id="toast" hidden></div>
+
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <!-- Índice de los mapas guardados en la carpeta mapas/ (lo crea descargar_mapa.py; si no existe, no pasa nada) -->
+  <script src="mapas/indice.js"></script>
+  <script src="sesion.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

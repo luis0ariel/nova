@@ -1,0 +1,2 @@
+Pon aqui tus rutas .gpx y tus respaldos .json
+para importarlos en la app (Inicio > Importar rutas).
