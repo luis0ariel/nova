@@ -5,7 +5,7 @@
  */
 'use strict';
 
-const VERSION_APP = 'v2.0.5';
+const VERSION_APP = 'v2.0.6';
 
 /* =========================================================
  * 1. Ajustes y utilidades
@@ -174,6 +174,7 @@ const estado = {
   sos: null,               // { activo, t, lat, lng, rol }
   bateria: null,           // { nivel, cargando } de este teléfono
   personaJefe: null,       // rol que el jefe tiene abierto en Monitoreo activo
+  monitoreo: null,         // ajuste 'monitoreo' (ver 8b)
   rutaAbierta: null,       // ruta mostrada en el detalle
   simulador: null,
   ultimoGuardado: 0,
@@ -296,6 +297,9 @@ function pintarHud() {
   } else {
     lim.hidden = true;
   }
+  const mon = $('#h-monitoreo');
+  mon.hidden = !monitoreoActivo();
+  if (!mon.hidden) hud('monitoreo', '📡 MONITOREO', 'ok');
 }
 
 function detalleEstado() {
@@ -303,7 +307,8 @@ function detalleEstado() {
   abrirModal('Estado', `
     <ul class="status">${filas}</ul>
     <p class="muted small">GPS: margen de error de tu ubicación (menos es mejor; la ruta solo graba con menos de ${PRECISION_MAXIMA} m).
-    NET: internet. BAT: batería. MAP: mosaicos del mapa guardados para usar sin internet.</p>`,
+    NET: internet. BAT: batería. MAP: mosaicos del mapa guardados para usar sin internet.
+    📡 MONITOREO: tu jefe ve tu ubicación porque lo aceptaste; solo él lo puede terminar.</p>`,
   [{ texto: 'Cerrar', clase: 'secondary' }]);
 }
 
@@ -509,11 +514,10 @@ async function recibirPosicion(lat, lng, precision, t, alt = null) {
 }
 
 /* Descanso automático: si en el último minuto te moviste menos de 15 m */
-/* Guarda la ubicación, batería y nombre para Monitoreo activo (vista del jefe).
- * Se hace sola mientras la sesión está abierta y hay permiso de GPS.
- * El jefe no se monitorea a sí mismo. */
+/* Guarda la ubicación, batería y nombre para la vista del jefe.
+ * SOLO si quien usa la app aceptó el monitoreo (ver 8b). */
 async function compartirUbicacion(p) {
-  if (!p || !Sesion.rol || Sesion.rol === 'jefe') return;
+  if (!p || !soyMonitoreado()) return;
   await DB.guardarAjuste('ultimaUbicacion', {
     lat: p.lat, lng: p.lng, precision: p.precision, t: p.t,
     rol: Sesion.rol, nombre: estado.perfil.nombre || '', bateria: estado.bateria,
@@ -603,6 +607,7 @@ document.addEventListener('visibilitychange', () => {
     return;
   }
   compartirUbicacion(estado.posicion);
+  pedirConsentimiento();
   if (estado.modo === 'grabando') {
     mantenerPantalla(true);
     const fuera = estado.ocultaDesde ? Date.now() - estado.ocultaDesde : 0;
@@ -727,10 +732,6 @@ function terminarRuta() {
       estado.grabacion = null;
       estado.modo = 'detenida';
       estado.acumuladoMs = 0;
-      // La hora límite era para esta salida; se quita al terminar
-      estado.horaLimite = null;
-      estado.avisoLimite = { previo: false, vencido: false };
-      await DB.guardarAjuste('horaLimite', null);
       if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
       actualizarBotones();
       await refrescarTodo();
@@ -797,10 +798,11 @@ function actualizarPanelGrabar() {
 /* =========================================================
  * 8. Hora límite, alertas y SOS
  * ========================================================= */
-/* Solo el jefe (y dev) la define, desde Monitoreo activo. Se guarda en este
- * teléfono (IndexedDB), así que las alertas le saltan al scout cuando entra. */
+/* Solo el jefe (y dev) la define: al iniciar el monitoreo o aquí, con el
+ * monitoreo activo. Las alertas le saltan al scout monitoreado. */
 function definirHoraLimite() {
   if (!['jefe', 'dev'].includes(Sesion.rol)) return;
+  if (!monitoreoActivo()) { aviso('Primero inicia un monitoreo'); return; }
   const quien = $('#j-nombre').textContent || 'la persona';
   const actual = estado.horaLimite ? new Date(estado.horaLimite).toTimeString().slice(0, 5) : '';
   abrirModal('Hora límite de regreso', `
@@ -809,27 +811,18 @@ function definirHoraLimite() {
     <input type="time" id="f-limite" value="${actual}">`,
   [
     { texto: 'Quitar', clase: 'secondary', accion: async () => {
-      estado.horaLimite = null;
-      estado.avisoLimite = { previo: false, vencido: false };
-      await DB.guardarAjuste('horaLimite', null);
-      refrescarInicio();
+      await aplicarHoraLimite(null);
+      estado.monitoreo.horaLimite = null;
+      await guardarMonitoreo(estado.monitoreo);
       refrescarJefe();
       aviso('Hora límite quitada');
     } },
     { texto: 'Guardar', clase: 'primary', accion: async () => {
       const valor = $('#f-limite').value;
       if (!valor) return;
-      const [h, m] = valor.split(':').map(Number);
-      const fecha = new Date();
-      fecha.setHours(h, m, 0, 0);
-      if (fecha.getTime() < Date.now()) fecha.setDate(fecha.getDate() + 1); // si ya pasó, es mañana
-      estado.horaLimite = fecha.getTime();
-      estado.avisoLimite = { previo: false, vencido: false };
-      await DB.guardarAjuste('horaLimite', estado.horaLimite);
-      if ('Notification' in window && Notification.permission === 'default') {
-        try { await Notification.requestPermission(); } catch { /* sin notificaciones */ }
-      }
-      refrescarInicio();
+      await aplicarHoraLimite(horaProxima(valor));
+      estado.monitoreo.horaLimite = estado.horaLimite;
+      await guardarMonitoreo(estado.monitoreo);
       refrescarJefe();
       aviso(`Hora límite: ${formatoHora(estado.horaLimite)}`);
     } },
@@ -838,8 +831,8 @@ function definirHoraLimite() {
 
 function revisarHoraLimite() {
   if (!estado.horaLimite || estado.modo === 'detenida') return;
-  // Las alertas son para quien camina; al jefe se le muestra en Monitoreo activo
-  if (!Sesion.rol || Sesion.rol === 'jefe') return;
+  // Las alertas son para el scout monitoreado; al jefe se le muestra en su pestaña
+  if (!soyMonitoreado()) return;
   const falta = estado.horaLimite - Date.now();
   if (falta <= 15 * 60 * 1000 && falta > 0 && !estado.avisoLimite.previo) {
     estado.avisoLimite.previo = true;
@@ -877,6 +870,205 @@ function alertar(titulo, texto) {
       if (reg) reg.showNotification(titulo, { body: texto, icon: 'icons/icon-192.png', tag: 'hora-limite' });
     }).catch(() => {});
   }
+}
+
+/* =========================================================
+ * 8b. Monitoreo con consentimiento
+ * =========================================================
+ * Ajuste 'monitoreo': { estado: 'pendiente'|'activo'|'rechazado'|'terminado',
+ *   jefe, horaLimite, solicitado, aceptado, rechazado, terminado, persona }
+ * Cada evento es { t, por: { rol, nombre } }. Los monitoreos anteriores se
+ * guardan en 'monitoreoHistorial' (los 10 más recientes).
+ * Sin monitoreo activo NO se guarda 'ultimaUbicacion'. El SOS funciona siempre.
+ */
+const yo = () => ({ rol: Sesion.rol, nombre: estado.perfil.nombre || '' });
+const textoQuien = (q) => {
+  if (!q) return '—';
+  const tipo = ROLES[q.rol] ? ROLES[q.rol].nombre : q.rol;
+  return q.nombre ? `${q.nombre} (${tipo})` : tipo;
+};
+const monitoreoActivo = () => !!(estado.monitoreo && estado.monitoreo.estado === 'activo');
+const monitoreoAbierto = () => !!(estado.monitoreo && ['pendiente', 'activo'].includes(estado.monitoreo.estado));
+const esMonitoreable = (rol) => !!rol && rol !== 'jefe' && rol !== 'dev';
+const soyMonitoreado = () => monitoreoActivo() && Sesion.rol === estado.monitoreo.persona;
+
+/* Convierte "HH:MM" en la próxima vez que llegue esa hora */
+function horaProxima(valor) {
+  const [h, m] = valor.split(':').map(Number);
+  const fecha = new Date();
+  fecha.setHours(h, m, 0, 0);
+  if (fecha.getTime() < Date.now()) fecha.setDate(fecha.getDate() + 1); // si ya pasó, es mañana
+  return fecha.getTime();
+}
+
+async function guardarMonitoreo(m) {
+  estado.monitoreo = m;
+  await DB.guardarAjuste('monitoreo', m);
+  pintarHud();
+}
+
+async function aplicarHoraLimite(t) {
+  estado.horaLimite = t || null;
+  estado.avisoLimite = { previo: false, vencido: false };
+  await DB.guardarAjuste('horaLimite', estado.horaLimite);
+  pintarHud();
+}
+
+/* Apaga el GPS si ya nada lo necesita (sin ruta, sin simulador y sin monitoreo propio) */
+function apagarGPSSiSobra() {
+  if (idWatch === null || estado.modo !== 'detenida' || estado.simulador || soyMonitoreado()) return;
+  navigator.geolocation.clearWatch(idWatch);
+  idWatch = null;
+  hud('gps', 'GPS --');
+}
+
+/* ---------- Jefe ---------- */
+function iniciarMonitoreo() {
+  if (!Sesion.puede('jefe dev')) return;
+  if (monitoreoAbierto()) { aviso('Ya hay un monitoreo pendiente o activo'); return; }
+  abrirModal('📡 Iniciar monitoreo', `
+    <p class="small">El scout recibe una solicitud y <b>debe aceptarla</b>. Mientras esté activo verás su ubicación, el estado de su ruta y la hora límite.</p>
+    <p class="muted small">Solo tú (o dev) lo puedes terminar.</p>
+    <label>Hora límite de regreso (opcional)<input type="time" id="f-mon-limite"></label>`,
+  [
+    { texto: 'Cancelar', clase: 'secondary' },
+    { texto: 'Enviar solicitud', clase: 'primary', accion: async () => {
+      const valor = $('#f-mon-limite').value;
+      const anterior = estado.monitoreo;
+      if (anterior) {
+        const historial = (await DB.leerAjuste('monitoreoHistorial')) || [];
+        await DB.guardarAjuste('monitoreoHistorial', [anterior, ...historial].slice(0, 10));
+      }
+      await guardarMonitoreo({
+        estado: 'pendiente',
+        jefe: yo(),
+        horaLimite: valor ? horaProxima(valor) : null,
+        solicitado: { t: Date.now(), por: yo() },
+        aceptado: null,
+        rechazado: null,
+        terminado: null,
+        persona: null,
+      });
+      refrescarJefe();
+      aviso('Solicitud enviada: el scout la verá al entrar');
+    } },
+  ]);
+}
+
+function terminarMonitoreo() {
+  const m = estado.monitoreo;
+  if (!Sesion.puede('jefe dev') || !monitoreoAbierto()) return;
+  const pendiente = m.estado === 'pendiente';
+  abrirModal(pendiente ? 'Cancelar solicitud' : 'Terminar monitoreo', pendiente
+    ? '<p>La solicitud se cancela y el scout ya no la verá.</p>'
+    : `<p>Dejarás de ver la ubicación de <b>${escapar(textoQuien(m.aceptado && m.aceptado.por))}</b>. Se borra su última ubicación guardada y la hora límite.</p>`,
+  [
+    { texto: 'No', clase: 'secondary' },
+    { texto: pendiente ? 'Cancelar solicitud' : 'Terminar', clase: 'danger', accion: async () => {
+      m.estado = 'terminado';
+      m.terminado = { t: Date.now(), por: yo() };
+      await guardarMonitoreo(m);
+      await aplicarHoraLimite(null);
+      await DB.guardarAjuste('ultimaUbicacion', null);
+      apagarGPSSiSobra();
+      refrescarJefe();
+      aviso(pendiente ? 'Solicitud cancelada' : 'Monitoreo terminado');
+    } },
+  ]);
+}
+
+function eventosMonitoreo(m) {
+  const terminado = m.aceptado ? 'Terminado' : 'Cancelado';
+  return [['Iniciado', m.solicitado], ['Aceptado', m.aceptado], ['Rechazado', m.rechazado], [terminado, m.terminado]]
+    .filter(([, e]) => e)
+    .map(([accion, e]) => `<li><b>${accion}</b> por ${escapar(textoQuien(e.por))} · ${formatoFecha(e.t)}, ${formatoHora(e.t)}</li>`)
+    .join('');
+}
+
+async function pintarMonitoreoJefe() {
+  const m = estado.monitoreo;
+  const est = m ? m.estado : null;
+  const textos = {
+    pendiente: ['⏳ Esperando que el scout acepte', 'pausa'],
+    activo: ['📡 Monitoreo activo', 'ok'],
+    rechazado: ['✕ El scout rechazó el monitoreo', 'alerta'],
+    terminado: ['Sin monitoreo activo', ''],
+  };
+  const [titulo, clase] = textos[est] || ['Sin monitoreo activo', ''];
+  const caja = $('#j-mon-estado');
+  caja.textContent = titulo;
+  caja.className = `estado-grande ${clase}`;
+  let texto = 'Sin monitoreo no se guarda la ubicación del scout. El SOS funciona siempre.';
+  if (est === 'pendiente') {
+    texto = `El scout verá la solicitud al entrar a Nova o al volver a la app. Hora límite: ${m.horaLimite ? formatoHora(m.horaLimite) : 'sin definir'}`;
+  } else if (est === 'activo') {
+    texto = `Aceptado por ${textoQuien(m.aceptado.por)}. Solo tú o dev lo pueden terminar.`;
+  }
+  $('#j-mon-texto').textContent = texto;
+  $('#j-mon-iniciar').hidden = monitoreoAbierto();
+  const fin = $('#j-mon-terminar');
+  fin.hidden = !monitoreoAbierto();
+  fin.textContent = est === 'pendiente' ? '✕ Cancelar solicitud' : '■ Terminar monitoreo';
+
+  const historial = [m, ...((await DB.leerAjuste('monitoreoHistorial')) || [])].filter(Boolean);
+  $('#j-mon-historial').innerHTML = historial.length
+    ? historial.map((h) => `<li class="evento-mon"><ul class="plain">${eventosMonitoreo(h)}</ul></li>`).join('')
+    : '<li class="muted">Todavía no hay monitoreos.</li>';
+
+  // El SOS se muestra aunque no haya monitoreo (lo activa el propio scout)
+  const sos = estado.sos && estado.sos.activo ? estado.sos : null;
+  const cajaSos = $('#j-sos');
+  cajaSos.hidden = !sos || monitoreoActivo();
+  if (sos && !monitoreoActivo()) {
+    const perfil = (await DB.leerAjuste(`perfil:${sos.rol}`)) || {};
+    cajaSos.innerHTML = `🆘 <b>SOS activo</b> de ${escapar(perfil.nombre || (ROLES[sos.rol] ? ROLES[sos.rol].nombre : 'un scout'))} desde las ${formatoHora(sos.t)}` +
+      (sos.lat !== null ? `<br>Ubicación al activarlo: ${sos.lat.toFixed(5)}, ${sos.lng.toFixed(5)}` : '<br>Sin ubicación al activarlo');
+  }
+}
+
+/* ---------- Scout ---------- */
+function pedirConsentimiento() {
+  const m = estado.monitoreo;
+  if (!m || m.estado !== 'pendiente' || !esMonitoreable(Sesion.rol)) return;
+  const jefe = m.jefe && m.jefe.nombre ? m.jefe.nombre : 'Tu jefe';
+  abrirModal('📡 Solicitud de monitoreo', `
+    <p><b>${escapar(jefe)}</b> quiere monitorearte durante la salida.</p>
+    <p class="small">Si aceptas, ${escapar(jefe)} verá en este teléfono:</p>
+    <ul class="small">
+      <li>Tu ubicación (se actualiza cada 15 segundos mientras la app está abierta).</li>
+      <li>El estado de tu ruta: en ruta, en pausa, en descanso o retrasado.</li>
+      <li>La hora límite de regreso: <b>${m.horaLimite ? formatoHora(m.horaLimite) : 'sin hora límite'}</b></li>
+    </ul>
+    <p class="small"><b>Hasta cuándo:</b> hasta que ${escapar(jefe)} lo termine. Tú no lo puedes apagar, ni cerrando sesión.</p>
+    <p class="muted small">El SOS funciona siempre, aceptes o no.</p>`,
+  [
+    { texto: 'Rechazar', clase: 'secondary', accion: () => responderMonitoreo(false) },
+    { texto: 'Aceptar', clase: 'primary', accion: () => responderMonitoreo(true) },
+  ]);
+}
+
+async function responderMonitoreo(acepta) {
+  const m = estado.monitoreo;
+  if (!m || m.estado !== 'pendiente' || !esMonitoreable(Sesion.rol)) return;
+  if (acepta) {
+    m.estado = 'activo';
+    m.aceptado = { t: Date.now(), por: yo() };
+    m.persona = Sesion.rol;
+    await guardarMonitoreo(m);
+    await aplicarHoraLimite(m.horaLimite);
+    iniciarGPS();
+    if (estado.posicion) compartirUbicacion(estado.posicion);
+    if (m.horaLimite && 'Notification' in window && Notification.permission === 'default') {
+      try { await Notification.requestPermission(); } catch { /* sin notificaciones */ }
+    }
+    aviso('📡 Monitoreo activo');
+  } else {
+    m.estado = 'rechazado';
+    m.rechazado = { t: Date.now(), por: yo() };
+    await guardarMonitoreo(m);
+    aviso('Rechazaste el monitoreo');
+  }
+  refrescarJefe();
 }
 
 /* ---------- Mis datos (perfil) ---------- */
@@ -988,6 +1180,7 @@ function abrirSMS(cuerpo, numeros = []) {
 }
 
 function abrirSOS() {
+  iniciarGPS(); // el SOS funciona siempre, con o sin monitoreo
   const activo = estado.sos && estado.sos.activo;
   const numeros = numerosSOS();
   const p = estado.perfil;
@@ -1039,6 +1232,7 @@ function mensajeUbicacion() {
 }
 
 function enviarUbicacion() {
+  iniciarGPS();
   const texto = mensajeUbicacion();
   const botones = [];
   if (navigator.share) {
@@ -1376,9 +1570,6 @@ async function importarArchivos(archivos) {
           await DB.guardarRuta(r);
           rutasNuevas++;
         }
-        if (datos.ultimaUbicacion && !(await DB.leerAjuste('ultimaUbicacion'))) {
-          await DB.guardarAjuste('ultimaUbicacion', datos.ultimaUbicacion);
-        }
       } else {
         await DB.guardarRuta(leerGPX(texto, archivo.name));
         rutasNuevas++;
@@ -1399,13 +1590,14 @@ async function importarArchivos(archivos) {
 
 function borrarTodo() {
   if (estado.modo !== 'detenida') { aviso('Termina la ruta en curso primero'); return; }
-  abrirModal('Borrar todos los datos', '<p>Se borrarán <b>todas las rutas</b>, tus datos, la última ubicación, la hora límite y el SOS de este teléfono. Haz un respaldo antes si las quieres conservar.</p>',
+  abrirModal('Borrar todos los datos', '<p>Se borrarán <b>todas las rutas</b>, tus datos, la última ubicación, el monitoreo, la hora límite y el SOS de este teléfono. Haz un respaldo antes si las quieres conservar.</p>',
   [
     { texto: 'Cancelar', clase: 'secondary' },
     { texto: 'Borrar todo', clase: 'danger', accion: async () => {
       await DB.borrarTodo();
       await DB.guardarAjuste('bienvenida', true);
       estado.horaLimite = null;
+      estado.monitoreo = null;
       estado.sos = null;
       estado.perfil = Object.assign({}, PERFIL_VACIO);
       estado.pruebas = false;
@@ -1423,16 +1615,17 @@ function borrarTodo() {
 const HORAS_MONITOREO = 12;
 const rolDe = (registro) => (registro && registro.rol) || 'scout'; // datos viejos no guardaban el rol
 
-/* Personas a cargo: quien tiene la ruta abierta, quien compartió su ubicación
- * hace menos de 12 horas o quien activó el SOS en este teléfono. */
+/* Persona a cargo: quien aceptó el monitoreo. Su ruta abierta, su última
+ * ubicación (de las últimas 12 horas) y su SOS. */
 async function personasMonitoreo(rutas) {
   const ultima = await DB.leerAjuste('ultimaUbicacion');
   const sos = await DB.leerAjuste('sos');
   const enCurso = rutas.find((r) => r.estado === 'en curso');
   const ubic = ultima && Date.now() - ultima.t < HORAS_MONITOREO * 3600000 ? ultima : null;
   const sosActivo = sos && sos.activo ? sos : null;
-  const roles = [...new Set([enCurso && rolDe(enCurso.autor), ubic && rolDe(ubic), sosActivo && rolDe(sosActivo)])]
-    .filter((rol) => rol && rol !== 'jefe' && ROLES[rol]);
+  // Solo se muestra a quien aceptó el monitoreo
+  if (!monitoreoActivo()) return [];
+  const roles = [estado.monitoreo.persona].filter((rol) => ROLES[rol]);
   return Promise.all(roles.map(async (rol) => ({
     rol,
     perfil: { ...PERFIL_VACIO, ...((await DB.leerAjuste(`perfil:${rol}`)) || {}) },
@@ -1484,11 +1677,12 @@ function lineasSaludPersona(perfil) {
 }
 
 async function refrescarJefe() {
+  if (!Sesion.puede('jefe dev')) return;
+  await pintarMonitoreoJefe();
   const rutas = await DB.todasLasRutas();
   const personas = await personasMonitoreo(rutas);
   if (!personas.some((p) => p.rol === estado.personaJefe)) estado.personaJefe = personas.length ? personas[0].rol : null;
-  $('#j-personas').innerHTML = personas.length ? personas.map(itemPersona).join('')
-    : '<p class="muted">Nadie comparte su ubicación ahora. Aparece aquí quien entre como scout con el GPS activado.</p>';
+  $('#j-personas').innerHTML = personas.map(itemPersona).join('');
 
   const p = personas.find((x) => x.rol === estado.personaJefe);
   $('#j-detalle').hidden = !p;
@@ -2033,7 +2227,10 @@ async function entrarComo(rol, silencioso = false) {
   pintarPerfil();
   refrescarTodo();
   irATab(ROLES[rol].inicio);
-  iniciarGPS();
+  // El GPS no se enciende al entrar: solo con monitoreo aceptado, ruta, SOS o "Enviar mi ubicación"
+  if (soyMonitoreado()) iniciarGPS();
+  pintarHud();
+  pedirConsentimiento();
   if (!silencioso) aviso(`Hola, ${estado.perfil.nombre.split(' ')[0] || ROLES[rol].nombre} ✦`);
 }
 
@@ -2042,7 +2239,8 @@ function menuCuenta() {
   const grabando = estado.modo !== 'detenida';
   abrirModal(`${info.icono} ${info.nombre}`, `
     <p class="small">Usuario: <b>${Sesion.rol}</b>${estado.perfil.nombre ? ` · ${escapar(estado.perfil.nombre)}` : ''}</p>
-    ${grabando ? '<p class="small aviso-texto">Tienes una ruta abierta. Quedará en pausa y se recupera al volver a entrar.</p>' : ''}`,
+    ${grabando ? '<p class="small aviso-texto">Tienes una ruta abierta. Quedará en pausa y se recupera al volver a entrar.</p>' : ''}
+    ${soyMonitoreado() ? '<p class="small aviso-texto">📡 El monitoreo sigue activo aunque cierres sesión. Solo tu jefe lo puede terminar.</p>' : ''}`,
   [
     { texto: 'Cerrar', clase: 'secondary' },
     { texto: 'Cerrar sesión', clase: 'danger', accion: cerrarSesion },
@@ -2052,6 +2250,7 @@ function menuCuenta() {
 async function cerrarSesion() {
   if (estado.modo === 'grabando') pausarRuta();
   detenerSimulador();
+  apagarGPSSiSobra();
   await Sesion.cerrar();
   estado.pruebas = false;
   document.body.classList.remove('pruebas');
@@ -2144,7 +2343,8 @@ function detenerSimulador() {
   clearInterval(estado.simulador);
   estado.simulador = null;
   $('#btn-simular').textContent = '▶ Simular recorrido de prueba';
-  iniciarGPS();
+  // Vuelve al GPS real solo si hace falta (ruta abierta o monitoreo aceptado)
+  if (estado.modo !== 'detenida' || soyMonitoreado()) iniciarGPS();
 }
 
 /* =========================================================
@@ -2199,6 +2399,8 @@ const acciones = {
   'centrar': centrarMapa,
   'guardar-zona': guardarZona,
   'jefe-limite': definirHoraLimite,
+  'monitoreo-iniciar': iniciarMonitoreo,
+  'monitoreo-terminar': terminarMonitoreo,
   'sos': abrirSOS,
   'simular': iniciarSimulador,
   'volver-lista': volverDeDetalle,
@@ -2303,6 +2505,12 @@ async function ofrecerInstalacion() {
  * ========================================================= */
 async function arrancar() {
   await DB.abrir();
+  estado.monitoreo = (await DB.leerAjuste('monitoreo')) || null;
+  if (!monitoreoActivo()) {
+    // Versiones anteriores guardaban la ubicación y la hora límite sin consentimiento
+    await DB.guardarAjuste('ultimaUbicacion', null);
+    await DB.guardarAjuste('horaLimite', null);
+  }
   estado.horaLimite = (await DB.leerAjuste('horaLimite')) || null;
   // Una hora límite de hace más de 12 horas ya no sirve
   if (estado.horaLimite && Date.now() - estado.horaLimite > 12 * 3600000) {
@@ -2366,7 +2574,7 @@ async function arrancar() {
   if (await Sesion.recuperar() && await DB.leerAjuste(`perfil:${Sesion.rol}`)) await entrarComo(Sesion.rol, true);
   else { await Sesion.cerrar(); await mostrarLogin(); }
 
-  // El permiso de ubicación se pide al entrar (entrarComo → iniciarGPS)
+  // El permiso de ubicación se pide solo al aceptar el monitoreo, iniciar una ruta, o usar SOS o "Enviar mi ubicación"
   pintarHud();
 }
 

@@ -56,6 +56,7 @@
   </header>
   <!-- Estado discreto, como el contador de FPS de un juego -->
   <div class="hud" id="hud" data-action="hud" title="Estado">
+    <span id="h-monitoreo" hidden></span><!-- primero: siempre visible -->
     <span id="h-gps">GPS --</span>
     <span id="h-net">NET --</span>
     <span id="h-bat">BAT --</span>
@@ -89,7 +90,7 @@
       </div>
       <div class="extra">
         <button class="secondary" data-action="enviar-ubicacion">📤 Enviar mi ubicación al jefe</button>
-        <button class="secondary" data-action="guardar-zona">⬇ Guardar mapa</button>
+        <button class="secondary" data-action="guardar-zona" data-roles="dev">⬇ Guardar mapa</button>
         <button class="secondary solo-pruebas" data-action="simular" id="btn-simular">▶ Simular recorrido de prueba</button>
         <p class="muted small">Mientras grabas, el mapa sigue tu posición y la pantalla se mantiene encendida. Toca 🔒 para moverlo libremente.</p>
       </div>
@@ -141,11 +142,17 @@
     <!-- ===== JEFE ===== -->
     <section id="tab-jefe" class="tab" data-roles="jefe dev">
       <h2 class="section-title">✦ JEFE</h2>
-      <p class="muted small">Nova no tiene servidor: aquí ves a las personas que usan este mismo teléfono.</p>
+      <p class="muted small">Nova no tiene servidor: aquí ves al scout que usa este mismo teléfono, solo si acepta el monitoreo.</p>
       <div class="card">
-        <h2>✦ Monitoreo activo</h2>
-        <p class="muted small">Personas a tu cargo con ruta abierta o que compartieron su ubicación en las últimas 12 horas. Toca una para ver su detalle.</p>
+        <h2>✦ Monitoreo</h2>
+        <div id="j-mon-estado" class="estado-grande">Sin monitoreo activo</div>
+        <p class="muted small" id="j-mon-texto"></p>
+        <button class="primary" id="j-mon-iniciar" data-action="monitoreo-iniciar">📡 Iniciar monitoreo</button>
+        <button class="danger" id="j-mon-terminar" data-action="monitoreo-terminar" hidden>■ Terminar monitoreo</button>
+        <p class="aviso-texto" id="j-sos" hidden></p>
         <div id="j-personas"></div>
+        <h3>Historial</h3>
+        <ul class="plain" id="j-mon-historial"></ul>
       </div>
       <div class="card" id="j-detalle" hidden>
         <h2 id="j-nombre">—</h2>

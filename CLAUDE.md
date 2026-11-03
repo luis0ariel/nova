@@ -8,6 +8,7 @@ Se usa en el **celular**: todo el código de la app es HTML, CSS y JavaScript si
 - Python solo se usa en herramientas de la computadora (`descargar_mapa.py` y como respaldo del servidor local). Nunca en la app.
 - La demostración debe funcionar abriendo iniciar.bat desde la USB, sin instalar nada. El servidor de Windows es `servidor.ps1` (PowerShell 5.1, solo ASCII).
 - Cada vez que cambies un archivo de la app, sube `VERSION` en `sw.js` y `VERSION_APP` en `app.js`; si agregas un archivo, añádelo a `ARCHIVOS_APP` en `sw.js`.
+- Nunca se guarda ni se comparte la ubicación de un scout sin su consentimiento (monitoreo aceptado). El SOS es la única excepción, porque lo activa el propio scout.
 - Todo funciona sin internet: no cargues scripts ni fuentes de CDN. Leaflet está en `vendor/leaflet/`.
 - Textos de la interfaz en español de México, claros y sin modismos.
 - En las instrucciones `switch` no uses `default`.
@@ -28,8 +29,9 @@ Espacial y galáctico, inspirado en consolas Nintendo. Fondos `#0d0d1a`, `#13131
 - La primera vez que entra cada usuario se pide su perfil de seguridad; después se edita en Perfil. Se guarda en `perfil:<rol>`.
 - Exportar rutas solo dentro del detalle de una ruta (.gpx o .nova.json).
 - Estados de ruta: `en curso` → `terminada` (sin enviar) → `pendiente_revision` → `validada` o `rechazada`. El envío al experto es manual, con "Enviar a validación de experto" en el detalle; nunca al terminar de grabar. `verificada` es de versiones viejas.
-- La ubicación se comparte sola con el jefe (cada 15 s, al pasar a segundo plano y al cerrar la app) en el mismo teléfono.
-- La hora límite de regreso solo la define el jefe (o dev) en Jefe → Monitoreo activo; el scout no tiene ese botón. Se guarda en `horaLimite` y las alertas (15 min antes y al vencer) le saltan al scout. No hay servidor: el monitoreo solo ve lo que hay en el mismo teléfono.
+- Monitoreo con consentimiento (ajuste `monitoreo`: pendiente → activo/rechazado → terminado; historial en `monitoreoHistorial`). El jefe lo inicia (hora límite opcional), el scout lo acepta o rechaza en una ventana al entrar o volver a la app. Activo: 📡 MONITOREO en `#hud`; el scout no lo apaga ni cerrando sesión; solo jefe o dev lo terminan. Solo entonces se guarda `ultimaUbicacion` (cada 15 s, al pasar a segundo plano y al cerrar la app).
+- El GPS no se enciende al iniciar sesión: solo al aceptar el monitoreo, iniciar una ruta, o usar SOS o "Enviar mi ubicación". "Guardar mapa" solo lo ve dev.
+- La hora límite de regreso solo la define el jefe (o dev), al iniciar el monitoreo o en el detalle con el monitoreo activo; el scout no tiene ese botón. Se guarda en `horaLimite` y las alertas (15 min antes y al vencer) le saltan al scout. No hay servidor: el monitoreo solo ve lo que hay en el mismo teléfono.
 - Borrar una ruta tarda 1 hora (`borrarEn`) y se puede cancelar.
 - Mientras se graba, el mapa está bloqueado (sigue la posición y no se arrastra); 🔒 lo libera.
 - La base de datos se sigue llamando `ruta-segura` para no perder datos de versiones anteriores.

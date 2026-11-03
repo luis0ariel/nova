@@ -1,4 +1,4 @@
-# ✦ Nova — v2.0.5
+# ✦ Nova — v2.0.6
 
 App web instalable (PWA) para registrar rutas de senderismo con GPS, sin internet. Está hecha con **HTML, CSS y JavaScript** y funciona en el celular. Su tema espacial está basado en StarPaint.
 
@@ -21,10 +21,10 @@ Cada tipo de usuario tiene su propio color y su propio perfil.
 
 | Pestaña | Qué hace |
 | --- | --- |
-| **Grabar** (inicio) | Mapa nocturno con la ruta en dorado; tiempo, distancia, ritmo y descansos; Iniciar, Pausar, Descanso y Terminar; enviar ubicación al jefe; guardar mapa. La ubicación y la batería se comparten solas con la vista del jefe mientras la sesión está abierta |
+| **Grabar** (inicio) | Mapa nocturno con la ruta en dorado; tiempo, distancia, ritmo y descansos; Iniciar, Pausar, Descanso y Terminar; enviar ubicación al jefe; guardar mapa (solo dev). La ubicación y la batería se comparten con el jefe **solo si el scout aceptó el monitoreo** |
 | **Rutas** | Lista e importar. Dentro de una ruta: mapa, estadísticas, paradas, **Enviar a validación de experto** (manual; nada se envía solo al terminar), revisión, renombrar, **exportar** (.gpx o .nova.json) y **borrar** |
 | **Perfil** | Nombre, fecha de nacimiento, tipo de sangre, alergias, padecimientos, contacto de emergencia y jefe; cerrar sesión |
-| **Jefe** | **Monitoreo activo**: lista de personas a cargo; al tocar una, su estado (en ruta, en descanso, retrasado, SOS), ubicación, batería, ruta, perfil de emergencia y la **hora límite de regreso**, que solo define el jefe. Rutas del grupo |
+| **Jefe** | **Monitoreo con consentimiento**: "Iniciar monitoreo" (hora límite opcional) manda una solicitud que el scout acepta o rechaza. Activo: estado (en ruta, en descanso, retrasado, SOS), ubicación, batería, ruta, perfil de emergencia y hora límite; "Terminar monitoreo" lo cierra. Historial de quién lo inició, aceptó, rechazó o terminó. Rutas del grupo |
 | **Revisar** | Rutas que los scouts enviaron (`pendiente_revision`) y revisadas. Dentro de una ruta: **recorrido de validación** (el experto la recorre y Nova compara distancia y desnivel; tolerancia 15 %). Si está dentro, se aprueba con fechas de vigencia y observaciones de seguridad y queda `validada` con la firma del experto. También se puede rechazar con nota |
 | **Admin** | Contraseñas, modo pruebas y sistema |
 
@@ -65,7 +65,7 @@ Si el puerto 8000 está ocupado, Nova se abre en el 8001 (hasta el 8009). El nav
 
 ## Mapa sin internet
 
-1. **En el teléfono, con internet:** en Grabar, acerca el mapa a la zona y toca **⬇ Guardar mapa**.
+1. **En el teléfono, con internet (usuario dev):** en Grabar, acerca el mapa a la zona y toca **⬇ Guardar mapa**.
 2. **En la carpeta `mapas/`:** en la PC, con internet, ejecuta `python3 descargar_mapa.py` (o `python3 descargar_mapa.py LAT LON RADIO_KM`). Descarga el mapa nocturno de la zona.
 
 ## Cuando cambies archivos

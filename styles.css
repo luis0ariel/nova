@@ -192,6 +192,11 @@ h3 { font-size: .85rem; color: var(--tenue); letter-spacing: .1em; text-transfor
 .estado-grande.pausa { color: var(--amarillo); border-color: var(--amarillo); }
 .estado-grande.alerta { color: var(--rojo); border-color: var(--rojo); box-shadow: 0 0 14px rgba(243, 139, 168, .25); }
 .revision { margin-top: 14px; }
+#j-mon-iniciar, #j-mon-terminar { width: 100%; margin: 4px 0 10px; }
+#j-personas:not(:empty) { margin-bottom: 10px; }
+#j-mon-historial, #j-mon-historial ul { list-style: none; margin: 0; padding: 0; }
+.evento-mon { border-left: 2px solid var(--borde); padding: 2px 0 2px 10px; margin: 6px 0; font-size: .78rem; }
+.evento-mon li { padding: 2px 0; }
 #d-enviar { width: 100%; margin-top: 14px; }
 .revision p { font-size: .85rem; }
 .revision .link { margin: 10px 0 0; }
