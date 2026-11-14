@@ -5,7 +5,7 @@
  */
 'use strict';
 
-const VERSION_APP = 'v2.2.0';
+const VERSION_APP = 'v2.1.0';
 
 /* =========================================================
  * 1. Ajustes y utilidades
@@ -188,7 +188,6 @@ const estado = {
   monitoreo: null,         // ajuste 'monitoreo' (ver 8b)
   rutaAbierta: null,       // ruta mostrada en el detalle
   simulador: null,
-  sosRemoto: null,         // SOS de otro teléfono (nube); no se guarda
   modoRed: 'online',       // ajuste 'modoRed': 'online' u 'offline' (lo cambia dev en Admin)
   simInicio: null,         // [lat, lng] elegido para empezar el recorrido inventado
   eligiendoInicio: null,   // { modo, datos } mientras se espera el toque en el mapa
@@ -227,7 +226,6 @@ async function alternarModoRed() {
   estado.modoRed = esOffline() ? 'online' : 'offline';
   await DB.guardarAjuste('modoRed', estado.modoRed);
   avisarModoRedAlSW();
-  Nube.revisar();
   pintarHud();
   refrescarAdmin();
   aviso(esOffline() ? 'Modo offline: Nova no usará internet' : 'Modo online activado');
@@ -340,15 +338,6 @@ function hud(id, texto, clase = '') {
 function pintarHud() {
   if (esOffline()) hud('net', 'MODO OFFLINE', 'medio');
   else hud('net', navigator.onLine ? 'NET ON' : 'NET OFF', navigator.onLine ? 'info' : 'medio');
-  const cfgNube = Nube.config();
-  $('#h-nube').hidden = !cfgNube.activa;
-  if (cfgNube.activa) {
-    const conexion = Nube.estado().conexion;
-    if (esOffline()) hud('nube', 'NUBE PAUSA', 'medio');
-    else if (conexion === 'conectada') hud('nube', 'NUBE ON', 'info');
-    else if (conexion === 'error') hud('nube', 'NUBE ERR', 'mal');
-    else hud('nube', 'NUBE …', 'medio');
-  }
   const lim = $('#h-limite');
   if (estado.horaLimite) {
     lim.hidden = false;
@@ -588,17 +577,10 @@ async function compartirUbicacion(p) {
     return;
   }
   if (!soyMonitoreado()) return;
-  const registro = {
+  await DB.guardarAjuste('ultimaUbicacion', {
     lat: p.lat, lng: p.lng, precision: p.precision, t: p.t,
     rol: Sesion.actual(), nombre: estado.perfil.nombre || '', bateria: estado.bateria, prueba: !!m.prueba,
-  };
-  await DB.guardarAjuste('ultimaUbicacion', registro);
-  subirUbicacionNube(registro);
-}
-
-/* Avisa al instante (si hay monitoreo activo) que cambió el estado de la ruta */
-function avisarCambioRuta() {
-  try { if (estado.posicion) compartirUbicacion(estado.posicion); } catch (e) { /* no debe romper la ruta */ }
+  });
 }
 
 /* Descanso automático: si en el último minuto te moviste menos de 15 m */
@@ -629,7 +611,6 @@ function abrirDescanso(tipo, inicio = ahora()) {
   estado.descansoActual = { inicio, tipo, punto: [estado.posicion.lat, estado.posicion.lng] };
   $('#btn-descanso').textContent = 'Seguir';
   actualizarPanelGrabar();
-  avisarCambioRuta();
 }
 
 function cerrarDescanso(fin = ahora()) {
@@ -641,7 +622,6 @@ function cerrarDescanso(fin = ahora()) {
   estado.descansoActual = null;
   $('#btn-descanso').textContent = 'Descanso';
   actualizarPanelGrabar();
-  avisarCambioRuta();
 }
 
 /* Paradas para rutas importadas: quieto (menos de 15 m) durante al menos 1 minuto */
@@ -727,7 +707,6 @@ function iniciarRuta(validar = null) {
     estado.inicioTramo = ahora();
     mantenerPantalla(true);
     actualizarBotones();
-    avisarCambioRuta();
     return;
   }
   const inicio = ahora();
@@ -763,7 +742,6 @@ function iniciarRuta(validar = null) {
   pintarGuia(estado.grabacion.validacionDe);
   mantenerPantalla(true);
   actualizarBotones();
-  avisarCambioRuta();
   aviso(validar ? 'Grabando recorrido de validación' : 'Grabando ruta');
 }
 
@@ -776,7 +754,6 @@ function pausarRuta() {
   DB.guardarRuta(estado.grabacion);
   mantenerPantalla(false);
   actualizarBotones();
-  avisarCambioRuta();
 }
 
 function alternarDescanso() {
@@ -1088,7 +1065,6 @@ function normalizarMonitoreo(m) {
 async function guardarMonitoreo(m) {
   estado.monitoreo = m;
   await DB.guardarAjuste('monitoreo', m);
-  subirMonitoreoNube(m);
   pintarHud();
 }
 
@@ -1230,7 +1206,6 @@ async function aceptarMonitoreo() {
   } else {
     m.monitoreado = yo();
     iniciarGPS();
-    limpiarUbicacionNube(); // por si quedó algo de un monitoreo anterior
   }
   delete m.ubicacion;
   await guardarMonitoreo(m);
@@ -1251,7 +1226,6 @@ async function rechazarMonitoreo() {
   delete m.ubicacion; // al rechazar no queda nada de su ubicación
   await guardarMonitoreo(m);
   await DB.guardarAjuste('ultimaUbicacion', null);
-  limpiarUbicacionNube();
   apagarGPSSiSobra();
   pintarBotonMonitoreo();
   refrescarJefe();
@@ -1333,7 +1307,6 @@ async function cerrarMonitoreo(como) {
   await guardarMonitoreo(m);
   await aplicarHoraLimite(null);
   await DB.guardarAjuste('ultimaUbicacion', null);
-  limpiarUbicacionNube();
   apagarGPSSiSobra();
   pintarBotonMonitoreo();
   refrescarJefe();
@@ -1411,12 +1384,12 @@ async function pintarMonitoreoJefe() {
     : '<li class="muted">Todavía no hay monitoreos.</li>';
 
   // El SOS se muestra aunque no haya monitoreo (lo activa el propio scout)
-  const sos = sosDelGrupo();
+  const sos = estado.sos && estado.sos.activo ? estado.sos : null;
   const cajaSos = $('#j-sos');
   cajaSos.hidden = !sos || monitoreoActivo();
   if (sos && !monitoreoActivo()) {
     const perfil = (await DB.leerAjuste(Sesion.clavePerfil(sos.rol, sos.prueba))) || {};
-    cajaSos.innerHTML = `🆘 <b>SOS activo</b> de ${escapar(perfil.nombre || sos.nombre || (ROLES[sos.rol] ? ROLES[sos.rol].nombre : 'un scout'))} desde las ${formatoHora(sos.t)}${chipPrueba(sos)}` +
+    cajaSos.innerHTML = `🆘 <b>SOS activo</b> de ${escapar(perfil.nombre || (ROLES[sos.rol] ? ROLES[sos.rol].nombre : 'un scout'))} desde las ${formatoHora(sos.t)}${chipPrueba(sos)}` +
       (sos.lat !== null ? `<br>Ubicación al activarlo: ${sos.lat.toFixed(5)}, ${sos.lng.toFixed(5)}` : '<br>Sin ubicación al activarlo');
   }
 }
@@ -1562,7 +1535,7 @@ function abrirSOS() {
     } },
     activo
       ? { texto: 'Desactivar SOS', clase: 'secondary', accion: async () => {
-          estado.sos = null; await DB.guardarAjuste('sos', null); subirSosNube(); refrescarJefe(); aviso('SOS desactivado');
+          estado.sos = null; await DB.guardarAjuste('sos', null); refrescarJefe(); aviso('SOS desactivado');
         } }
       : { texto: 'Cancelar', clase: 'secondary' },
   ]);
@@ -1608,7 +1581,6 @@ async function activarSOS() {
   const p = estado.posicion;
   estado.sos = { activo: true, t: Date.now(), lat: p ? p.lat : null, lng: p ? p.lng : null, rol: Sesion.actual(), prueba: Sesion.esDev() };
   await DB.guardarAjuste('sos', estado.sos);
-  subirSosNube();
   await compartirUbicacion(p);
   refrescarJefe();
 }
@@ -1985,7 +1957,6 @@ function borrarTodo() {
     { texto: 'Cancelar', clase: 'secondary' },
     { texto: 'Borrar todo', clase: 'danger', accion: async () => {
       await DB.borrarTodo();
-      Nube.apagar();
       await DB.guardarAjuste('bienvenida', true);
       estado.horaLimite = null;
       estado.monitoreo = null;
@@ -2010,35 +1981,28 @@ const rolDe = (registro) => (registro && registro.rol) || 'scout'; // datos viej
  * ubicación (de las últimas 12 horas) y su SOS. */
 async function personasMonitoreo(rutas) {
   const ultima = await DB.leerAjuste('ultimaUbicacion');
+  const sos = await DB.leerAjuste('sos');
   const enCurso = rutas.find((r) => r.estado === 'en curso');
   const ubic = ultima && ahora() - ultima.t < HORAS_MONITOREO * 3600000 ? ultima : null;
-  const sosActivo = sosDelGrupo();
+  const sosActivo = sos && sos.activo ? sos : null;
   // Solo se muestra a quien aceptó el monitoreo
   if (!monitoreoActivo()) return [];
   const m = estado.monitoreo;
   const roles = [m.monitoreado && m.monitoreado.rol].filter((rol) => ROLES[rol]);
-  return Promise.all(roles.map(async (rol) => {
-    const ubicRol = ubic && rolDe(ubic) === rol && !!ubic.prueba === !!m.prueba ? ubic : null;
-    const local = enCurso && rolDe(enCurso.autor) === rol && !!enCurso.prueba === !!m.prueba ? enCurso : null;
-    return {
-      rol,
-      perfil: { ...PERFIL_VACIO, ...((await DB.leerAjuste(Sesion.clavePerfil(rol, m.prueba))) || {}) },
-      ubic: ubicRol,
-      // Si la persona está en otro teléfono, su ruta se arma con lo que subió a la nube
-      ruta: local || rutaRemota(rol, ubicRol),
-      sos: sosActivo && rolDe(sosActivo) === rol ? sosActivo : null,
-    };
-  }));
+  return Promise.all(roles.map(async (rol) => ({
+    rol,
+    perfil: { ...PERFIL_VACIO, ...((await DB.leerAjuste(Sesion.clavePerfil(rol, m.prueba))) || {}) },
+    ubic: ubic && rolDe(ubic) === rol && !!ubic.prueba === !!m.prueba ? ubic : null,
+    ruta: enCurso && rolDe(enCurso.autor) === rol && !!enCurso.prueba === !!m.prueba ? enCurso : null,
+    sos: sosActivo && rolDe(sosActivo) === rol ? sosActivo : null,
+  })));
 }
 
 function estadoPersona(p) {
-  // Descanso y pausa son de la persona: si está en otro teléfono vienen en el resumen de la nube
-  const enDescanso = p.ruta && p.ruta.remota ? p.ruta.descanso : !!estado.descansoActual;
-  const enPausa = p.ruta && p.ruta.remota ? p.ruta.modo === 'pausada' : estado.modo === 'pausada';
   if (p.sos) return { texto: `🆘 SOS activo desde las ${formatoHora(p.sos.t)}`, corto: '🆘 SOS', clase: 'alerta' };
   if (p.ruta && estado.horaLimite && ahora() > estado.horaLimite) return { texto: '⚠ Retrasado', corto: '⚠ retrasado', clase: 'alerta' };
-  if (p.ruta && enDescanso) return { texto: '⏸ En descanso', corto: 'descanso', clase: 'pausa' };
-  if (p.ruta && enPausa) return { texto: '⏸ Ruta en pausa', corto: 'en pausa', clase: 'pausa' };
+  if (p.ruta && estado.descansoActual) return { texto: '⏸ En descanso', corto: 'descanso', clase: 'pausa' };
+  if (p.ruta && estado.modo === 'pausada') return { texto: '⏸ Ruta en pausa', corto: 'en pausa', clase: 'pausa' };
   if (p.ruta) return { texto: '🥾 En ruta', corto: 'en ruta', clase: 'ok' };
   return { texto: 'Sin ruta activa', corto: 'sin ruta', clase: '' };
 }
@@ -2748,7 +2712,6 @@ async function usarGenerado(original) {
  * ========================================================= */
 async function refrescarAdmin() {
   if (!Sesion.puede('dev')) return;
-  pintarNubeAdmin(true);
   $('#a-red').textContent = esOffline() ? '📴 Offline' : '🌐 Online';
   $('#btn-red').textContent = esOffline() ? 'Cambiar a online' : 'Cambiar a offline';
   const filas = await Promise.all(Object.entries(ROLES).map(async ([rol, info]) => {
@@ -2950,7 +2913,6 @@ async function cargarPerfil() {
 
 async function entrarComo(rol, silencioso = false) {
   await cargarPerfil();
-  await aplicarNube(); // lo último que haya en la nube (monitoreo, SOS)
   aplicarPermisos();
   moverFormPerfil();
   refrescarTodo();
@@ -3376,10 +3338,6 @@ const acciones = {
   'centrar': centrarMapa,
   'guardar-zona': guardarZona,
   'alternar-red': alternarModoRed,
-  'nube-alternar': alternarNube,
-  'nube-generar': generarCodigoNube,
-  'nube-probar': probarNube,
-  'nube-limpiar': limpiarNube,
   'jefe-limite': definirHoraLimite,
   'monitoreo-iniciar': iniciarMonitoreo,
   'monitoreo-aceptar': () => { if (meTocaResponder()) aceptarMonitoreo(); },
@@ -3496,266 +3454,6 @@ async function ofrecerInstalacion() {
 }
 
 /* =========================================================
- * 15b. Nube (Firebase): monitoreo entre teléfonos
- * =========================================================
- * Ajuste 'nube': { url, codigo, activa }. Solo dev lo configura (Admin → Nube) y vale
- * para todos los usuarios de este teléfono. Qué se sincroniza (ver nube.js):
- *   monitoreo  lo escribe quien lo cambia y lo reciben todos (el mismo objeto del ajuste 'monitoreo')
- *   ubicacion  solo la sube quien aceptó el monitoreo, y solo si en la nube el monitoreo está activo
- *   rastro     puntos de su ruta abierta, para dibujarla en el teléfono del jefe
- *   sos        lo sube quien lo activa (el SOS funciona siempre)
- * El perfil de salud (sangre, alergias…) NO se sube. Las sesiones de dev (vistas de prueba)
- * no suben ni reciben nada: lo de prueba se queda en el teléfono. En modo offline la nube se
- * pausa y lo pendiente se sube al volver a online.
- */
-const nubeLista = () => Nube.activa() && !Sesion.esDev();
-
-function subirMonitoreoNube(m) {
-  if (!m || m.prueba || !nubeLista()) return;
-  Nube.subir('monitoreo', m);
-}
-
-/* Resumen de la ruta abierta de este teléfono, para que el jefe vea su estado */
-function resumenRutaNube() {
-  if (!estado.grabacion || estado.modo === 'detenida') return null;
-  return { modo: estado.modo, descanso: !!estado.descansoActual, inicio: estado.grabacion.tiempos.inicio };
-}
-
-function subirUbicacionNube(registro) {
-  if (!registro || registro.prueba || !nubeLista()) return;
-  // Solo se sube si en la nube el monitoreo está activo: un consentimiento viejo guardado
-  // en este teléfono no basta
-  const m = Nube.datos().monitoreo;
-  const activoEnNube = (m && m.estado === 'activo') || Nube.hayPendiente('monitoreo');
-  if (!activoEnNube) return;
-  const ruta = resumenRutaNube();
-  const previa = Nube.datos().ubicacion;
-  const rutaNueva = Nube.sincronizada() && !!ruta && (!previa || !previa.ruta || previa.ruta.inicio !== ruta.inicio);
-  Nube.subir('ubicacion', { ...registro, ruta });
-  if (!ruta) return;
-  const punto = [Number(registro.lat.toFixed(6)), Number(registro.lng.toFixed(6))];
-  if (rutaNueva) Nube.subir('rastro', { [registro.t]: punto }); // ruta nueva: se empieza el rastro de cero
-  else Nube.subir(`rastro/${registro.t}`, punto);
-}
-
-function limpiarUbicacionNube() {
-  if (!nubeLista()) return;
-  Nube.subir('ubicacion', null);
-  Nube.subir('rastro', null);
-}
-
-function subirSosNube() {
-  const s = estado.sos;
-  if (!nubeLista() || (s && s.prueba)) return;
-  Nube.subir('sos', s && s.activo
-    ? { activo: true, t: s.t, lat: s.lat, lng: s.lng, rol: s.rol, nombre: estado.perfil.nombre || '' } : null);
-}
-
-/* El SOS que se muestra al jefe: el de otro teléfono (nube) o el de este mismo teléfono */
-function sosDelGrupo() {
-  if (estado.sosRemoto && estado.sosRemoto.activo) return estado.sosRemoto;
-  return estado.sos && estado.sos.activo ? estado.sos : null;
-}
-
-/* Ruta de la persona monitoreada cuando está en otro teléfono, armada con lo de la nube */
-function rutaRemota(rol, ubic) {
-  if (!Nube.activa() || Sesion.esDev() || soyElMonitoreado() || !ubic || !ubic.ruta) return null;
-  const rastro = Nube.datos().rastro || {};
-  const coordenadas = Object.keys(rastro).map(Number).sort((x, y) => x - y)
-    .map((t) => [rastro[t][0], rastro[t][1], t]);
-  return {
-    remota: true, modo: ubic.ruta.modo, descanso: !!ubic.ruta.descanso,
-    coordenadas, tiempos: { inicio: ubic.ruta.inicio }, autor: { rol }, prueba: false,
-  };
-}
-
-/* Lo que llega de la nube se copia al teléfono, sin volver a subirlo */
-async function adoptarMonitoreo(nuevo) {
-  const anterior = estado.monitoreo;
-  estado.monitoreo = nuevo;
-  await DB.guardarAjuste('monitoreo', nuevo);
-  const limite = nuevo.estado === 'activo' ? (nuevo.horaLimite || null) : null;
-  if (limite !== (estado.horaLimite || null)) await aplicarHoraLimite(limite);
-  if (anterior && anterior.estado === 'activo' && nuevo.estado !== 'activo') {
-    // Terminó o cambió en otro teléfono: se borra lo guardado y se apaga el GPS si ya no hace falta
-    await DB.guardarAjuste('ultimaUbicacion', null);
-    apagarGPSSiSobra();
-    if (soyElMonitoreado(nuevo) && nuevo.estado === 'terminado') aviso('El monitoreo terminó', 4000);
-  }
-  if (soyMonitoreado()) {
-    iniciarGPS();
-    if (estado.posicion) compartirUbicacion(estado.posicion);
-  }
-  pintarHud();
-  pintarBotonMonitoreo();
-  if (Sesion.rol) { revisarSolicitudesSinInterrumpir(); refrescarJefe(); }
-}
-
-/* La solicitud no debe cerrar una ventana abierta (el SOS, por ejemplo): espera a que se cierre */
-function revisarSolicitudesSinInterrumpir(intento = 0) {
-  if ($('#modal').open) {
-    if (intento < 24) setTimeout(() => revisarSolicitudesSinInterrumpir(intento + 1), 5000);
-    return;
-  }
-  revisarSolicitudes();
-}
-
-function avisarSosRemoto(s) {
-  if (Sesion.actual() !== 'jefe') return;
-  const quien = s.nombre || (ROLES[s.rol] ? ROLES[s.rol].nombre : 'Alguien');
-  alertar('🆘 SOS', `${quien} activó el SOS.`);
-  abrirModal('🆘 SOS activo', `
-    <p><b>${escapar(quien)}</b> activó el SOS a las ${formatoHora(s.t)}.</p>
-    <p class="small">${s.lat !== null ? `Ubicación al activarlo: ${s.lat.toFixed(5)}, ${s.lng.toFixed(5)}` : 'Sin ubicación al activarlo.'}</p>`,
-  [
-    { texto: 'Cerrar', clase: 'secondary' },
-    { texto: 'Ver en Jefe', clase: 'danger', accion: () => irATab('jefe') },
-  ]);
-}
-
-let aplicandoNube = false;
-let repetirNube = false;
-
-async function aplicarNube() {
-  if (aplicandoNube) { repetirNube = true; return; }
-  aplicandoNube = true;
-  try {
-    do {
-      repetirNube = false;
-      await aplicarNubeUnaVez();
-    } while (repetirNube);
-  } catch (err) {
-    console.warn('Nube:', err);
-  } finally {
-    aplicandoNube = false;
-  }
-}
-
-async function aplicarNubeUnaVez() {
-  if (!Nube.activa() || Sesion.esDev() || !Nube.sincronizada()) return;
-  const d = Nube.datos();
-
-  // 1. Monitoreo: si la nube tiene uno distinto, se adopta (salvo que este teléfono tenga un cambio por enviar)
-  if (d.monitoreo && !Nube.hayPendiente('monitoreo')) {
-    const remoto = normalizarMonitoreo({
-      jefe: null, monitoreado: null, motivo: '', horaLimite: null, aceptado: null, rechazado: null, terminado: null,
-      ...d.monitoreo,
-    });
-    if (!nubeIgual(remoto, estado.monitoreo)) await adoptarMonitoreo(remoto);
-  }
-
-  // 2. Ubicación: la copia el teléfono de quien monitorea (la vista del jefe la lee de aquí)
-  if (monitoreoActivo() && !soyElMonitoreado() && d.ubicacion) {
-    const local = await DB.leerAjuste('ultimaUbicacion');
-    if (!nubeIgual(d.ubicacion, local)) await DB.guardarAjuste('ultimaUbicacion', d.ubicacion);
-  }
-
-  // 3. SOS de otro teléfono
-  const sos = d.sos && d.sos.activo ? { ...d.sos, lat: d.sos.lat ?? null, lng: d.sos.lng ?? null, prueba: false } : null;
-  if (!nubeIgual(sos, estado.sosRemoto)) {
-    const nuevo = !!sos && (!estado.sosRemoto || estado.sosRemoto.t !== sos.t);
-    estado.sosRemoto = sos;
-    if (nuevo) avisarSosRemoto(sos);
-  }
-
-  pintarHud();
-  if (Sesion.rol && $('#tab-jefe').classList.contains('active')) refrescarJefe();
-}
-
-/* ---------- Arranque y pantalla de Admin ---------- */
-async function iniciarNube() {
-  const guardado = (await DB.leerAjuste('nube')) || {};
-  Nube.permitidoSi(() => !esOffline());
-  Nube.alCambiar(() => aplicarNube());
-  Nube.alEstado(() => { pintarHud(); pintarNubeAdmin(); });
-  Nube.configurar({ url: guardado.url, codigo: guardado.codigo, activa: !!guardado.activa });
-}
-
-const TEXTOS_NUBE = {
-  apagada: '⚪ Apagada', pausada: '⏸ En pausa', conectando: '🔄 Conectando…',
-  conectada: '🟢 Conectada', 'sin-red': '🔴 Sin conexión (reintentando)',
-};
-
-function textoEstadoNube() {
-  const c = Nube.config();
-  const e = Nube.estado();
-  if (!c.activa) return '⚪ Apagada';
-  if (esOffline()) return '⏸ En pausa (modo offline)';
-  if (e.conexion === 'error') return `⚠ ${e.detalle}`;
-  const pendientes = Nube.cuantosPendientes();
-  return `${TEXTOS_NUBE[e.conexion] || e.conexion}${pendientes ? ` · ${pendientes} por enviar` : ''}`;
-}
-
-function pintarNubeAdmin(llenar = false) {
-  const lugar = $('#n-estado');
-  if (!lugar) return;
-  const c = Nube.config();
-  lugar.textContent = textoEstadoNube();
-  $('#btn-nube').textContent = c.activa ? 'Apagar la nube' : 'Activar la nube';
-  // Los campos solo se rellenan si la persona no los está editando
-  if (llenar && document.activeElement !== $('#n-codigo') && document.activeElement !== $('#n-url')) {
-    $('#n-codigo').value = c.codigo;
-    $('#n-url').value = c.url;
-  }
-}
-
-const leerFormNube = () => ({
-  url: $('#n-url').value.trim() || NUBE_URL_PREDETERMINADA,
-  codigo: $('#n-codigo').value.trim(),
-});
-
-async function alternarNube() {
-  if (!Sesion.esDev()) return;
-  const f = leerFormNube();
-  if (Nube.config().activa) {
-    await DB.guardarAjuste('nube', { ...f, activa: false });
-    Nube.configurar({ ...f, activa: false });
-    aviso('Nube apagada');
-  } else {
-    if (!NUBE_CODIGO_VALIDO.test(f.codigo)) { aviso('El código necesita de 16 a 64 letras o números', 4000); return; }
-    await DB.guardarAjuste('nube', { ...f, activa: true });
-    Nube.configurar({ ...f, activa: true });
-    aviso('Conectando con la nube…');
-  }
-  pintarNubeAdmin();
-  pintarHud();
-}
-
-function generarCodigoNube() {
-  const letras = 'abcdefghijkmnpqrstuvwxyz23456789'; // sin letras que se confunden (l, o, 0, 1)
-  const bytes = crypto.getRandomValues(new Uint8Array(24));
-  $('#n-codigo').value = Array.from(bytes, (b) => letras[b % letras.length]).join('');
-  aviso('Código nuevo. Usa el mismo en todos los teléfonos', 4000);
-}
-
-async function probarNube() {
-  if (!Sesion.esDev()) return;
-  if (esOffline()) { aviso('Modo offline: cámbialo a online para probar la nube', 4000); return; }
-  const f = leerFormNube();
-  aviso('Probando la conexión…', 3000);
-  let pasos;
-  try { pasos = await Nube.probar(f.url, f.codigo); }
-  catch (err) { pasos = [{ nombre: 'Prueba', ok: false, texto: nubeTextoError(err) }]; }
-  const todo = pasos.every((p) => p.ok);
-  abrirModal(todo ? '✓ La nube está lista' : '⚠ La nube no está lista', `
-    ${pasos.map((p) => `<p class="small"><b>${p.ok ? '✓' : '✗'} ${escapar(p.nombre)}:</b> ${escapar(p.texto)}</p>`).join('')}
-    ${todo ? '<p class="muted small">La base responde y las reglas permiten leer y escribir con este código.</p>' : ''}`,
-  [{ texto: 'Entendido', clase: 'primary' }]);
-}
-
-function limpiarNube() {
-  if (!Sesion.esDev()) return;
-  if (esOffline()) { aviso('Modo offline: cámbialo a online para usar la nube', 4000); return; }
-  abrirModal('Borrar los datos del grupo', '<p>Se borran de la nube el monitoreo, la ubicación, el rastro y el SOS de este grupo. Sirve para empezar de cero entre pruebas.</p>', [
-    { texto: 'Cancelar', clase: 'secondary' },
-    { texto: 'Borrar', clase: 'danger', accion: async () => {
-      try { await Nube.limpiarGrupo(); aviso('Datos del grupo borrados'); }
-      catch (err) { aviso(err && err.estado ? nubeTextoError(err) : 'Primero activa la nube con un código válido', 5000); }
-    } },
-  ]);
-}
-
-/* =========================================================
  * 16. Arranque
  * ========================================================= */
 async function arrancar() {
@@ -3775,7 +3473,6 @@ async function arrancar() {
   estado.sos = (await DB.leerAjuste('sos')) || null;
   estado.pruebas = !!(await DB.leerAjuste('pruebas'));
   estado.modoRed = (await DB.leerAjuste('modoRed')) === 'offline' ? 'offline' : 'online';
-  await iniciarNube();
   pintarPerfil();
 
   // Si la app se cerró a media ruta, se recupera como pausada

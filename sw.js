@@ -3,7 +3,7 @@
  * - Guarda los mosaicos del mapa que ya viste (y las zonas que guardes), para verlos sin internet.
  * Cambia VERSION cada vez que modifiques archivos de la app.
  */
-const VERSION = 'v2.2.0';
+const VERSION = 'v2.1.0';
 const CACHE_APP = `ruta-segura-app-${VERSION}`;
 const CACHE_MAPA = 'nova-mapa';
 const CACHE_MAPA_VIEJA = 'ruta-segura-mapa'; // tiene mosaicos de CARTO con la marca "API KEY REQUIRED"
@@ -50,7 +50,6 @@ const ARCHIVOS_APP = [
   'styles.css',
   'app.js',
   'sesion.js',
-  'nube.js',
   'manifest.json',
   'icons/icon-192.png',
   'icons/icon-512.png',

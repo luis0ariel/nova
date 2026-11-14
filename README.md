@@ -1,4 +1,4 @@
-# ✦ Nova — v2.2.0
+# ✦ Nova — v2.1.0
 
 App web instalable (PWA) para registrar rutas de senderismo con GPS, sin internet. Está hecha con **HTML, CSS y JavaScript** y funciona en el celular. Su tema espacial está basado en StarPaint.
 
@@ -32,7 +32,6 @@ Cada tipo de usuario tiene su propio color y su propio perfil.
 - **Mapa bloqueado 🔒** mientras grabas: sigue tu posición y no se arrastra. Toca 🔒 para moverlo libremente, ⤢ para ver toda la ruta y ◎ para centrar.
 - **Borrar ruta:** se borra **1 hora después**. Mientras tanto aparece "Se borrará a las…" con el botón **Cancelar borrado**.
 - **SOS:** el SMS va al contacto de emergencia y al jefe, con tu ubicación, edad, tipo de sangre, alergias y padecimientos. También hay un botón para llamar al 911.
-- **Nube (Firebase)** (solo `dev`, en Admin → Nube): sincroniza el monitoreo entre teléfonos. El jefe ve en su teléfono la ubicación, la batería, la ruta y el estado (en ruta, en descanso, retrasado) de quien aceptó, y recibe el SOS de otro teléfono con alerta. Todos los teléfonos usan el mismo **código de grupo** (16 o más letras y números); sin ese código no se puede leer nada. Solo se sube lo que el monitoreado aceptó compartir y su SOS; el perfil de salud no se sube. Funciona con la app abierta y la pantalla encendida: al bloquear el celular, Android congela la app. El botón **Probar** revisa la base paso a paso. En modo offline la nube se pausa. Las vistas de prueba de dev no suben ni reciben nada.
 - **Modo online / offline** (solo `dev`, en Admin → Conexión): un botón alterna entre los dos. En **offline** Nova no usa internet: el mapa solo muestra la carpeta `mapas/` y los mosaicos ya guardados, "Guardar mapa" se bloquea y la barra de estado dice MODO OFFLINE. En **online** funciona como siempre. El ajuste se guarda en el teléfono y vale para todos los usuarios.
 - **Punto de inicio de la simulación:** en la ventana de "Simular recorrido" (recorrido inventado) toca **Elegir inicio en el mapa**, mueve el mapa y toca. Si no eliges, arranca en el punto de siempre. "Repetir como demo" empieza donde empieza la ruta.
 - **Modo pruebas** (solo `dev`, en Admin): muestra "Simular recorrido" en Grabar y "Repetir como demo" dentro de una ruta (en las vistas de prueba siempre están). Eliges la duración (hasta 12 h) y la velocidad (1x a 50x); un reloj virtual hace que la ruta guarde el tiempo simulado. Ej.: 2 h a 50x tarda 2.4 min reales.
@@ -85,7 +84,6 @@ Sube el número de `VERSION` en `sw.js` y `VERSION_APP` en `app.js`; si no, el t
 | `index.html` | Pantallas, inicio de sesión y formulario de perfil |
 | `styles.css` | Tema espacial de Nova |
 | `sesion.js` | Usuarios, contraseñas y permisos |
-| `nube.js` | Conexión con Firebase (API REST y tiempo real, sin SDK) |
 | `app.js` | GPS, mapa, registro, perfil, SOS, jefe, revisión, admin |
 | `sw.js` | Service Worker (modo sin internet) |
 | `manifest.json` | Instalación como app |

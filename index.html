@@ -62,7 +62,6 @@
     <span id="h-mapa">MAP --</span>
     <span id="h-limite" hidden></span>
     <span id="h-sim" hidden></span>
-    <span id="h-nube" hidden></span>
   </div>
 
   <main>
@@ -237,21 +236,6 @@
         <p class="muted small">Offline: Nova no usa internet. El mapa solo muestra la carpeta mapas/ y los mosaicos ya guardados. Online: usa internet cuando hay y guarda los mosaicos que ve. El cambio vale para todos los usuarios de este teléfono.</p>
       </div>
       <div class="card">
-        <h2>Nube (Firebase)</h2>
-        <ul class="status"><li><span>Estado</span><b id="n-estado">—</b></li></ul>
-        <label class="campo">Código del grupo (16 o más letras y números)
-          <input id="n-codigo" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="Ej. k7m2p9x4c8v3b6n5q2w7e4r9"></label>
-        <label class="campo">Dirección de la base
-          <input id="n-url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="https://…firebaseio.com"></label>
-        <div class="controls dos">
-          <button class="secondary" data-action="nube-generar">🎲 Código nuevo</button>
-          <button class="secondary" data-action="nube-probar">🔍 Probar</button>
-        </div>
-        <button class="primary" id="btn-nube" data-action="nube-alternar" style="width:100%">Activar la nube</button>
-        <button class="link peligro" data-action="nube-limpiar">Borrar los datos del grupo en la nube</button>
-        <p class="muted small">Con la nube activa, el jefe ve en su teléfono la ubicación, la ruta y el SOS de quien aceptó el monitoreo. Todos los teléfonos del grupo necesitan el <b>mismo código</b>: configúralo en cada uno entrando como dev. Solo se sube lo que el monitoreado aceptó compartir y su SOS; el perfil de salud no se sube. Funciona mientras la app está abierta y con la pantalla encendida.</p>
-      </div>
-      <div class="card">
         <h2>Sistema</h2>
         <ul class="status" id="a-sistema"></ul>
         <button class="link peligro" data-action="borrar-todo">Borrar todos los datos</button>
@@ -322,7 +306,6 @@
   <script src="vendor/leaflet/leaflet.js"></script>
   <!-- Índice de los mapas guardados en la carpeta mapas/ (lo crea descargar_mapa.py; si no existe, no pasa nada) -->
   <script src="mapas/indice.js"></script>
-  <script src="nube.js"></script>
   <script src="sesion.js"></script>
   <script src="app.js"></script>
 </body>
