@@ -21,27 +21,23 @@
     <div class="login-caja">
       <div class="logo-nova"><span class="estrella">✦</span> NOVA</div>
 
-      <!-- Paso 1: elegir usuario -->
-      <div id="paso-roles" class="paso">
-        <p class="login-sub">¿QUIÉN ERES?</p>
-        <div class="roles" id="l-roles"></div>
+      <!-- Paso 1: usuario y contraseña -->
+      <div id="paso-login" class="paso">
+        <form id="f-login" class="form-login" autocomplete="off">
+          <label class="campo">Usuario<input id="l-usuario" autocapitalize="none" autocomplete="username" spellcheck="false" placeholder="Ej. scout"></label>
+          <label class="campo">Contraseña<input id="l-clave" type="password" autocomplete="current-password"></label>
+          <p id="l-error" class="login-error" hidden>Usuario o contraseña incorrectos</p>
+          <button class="primary big" type="submit">Entrar</button>
+        </form>
       </div>
 
-      <!-- Paso 2: contraseña -->
-      <div id="paso-pin" class="paso" hidden>
-        <div class="rol-elegido" id="l-rol"></div>
-        <div class="pin" id="l-puntos" aria-live="polite"></div>
-        <p id="l-error" class="login-error" hidden>Contraseña incorrecta</p>
-        <div class="teclado" id="l-teclado"></div>
-        <button class="link" type="button" data-login="volver">← Cambiar de usuario</button>
-      </div>
-
-      <!-- Paso 3: datos la primera vez -->
+      <!-- Paso 2: datos la primera vez -->
       <div id="paso-registro" class="paso" hidden>
         <p class="login-sub">✦ TU PERFIL DE SEGURIDAD</p>
         <p class="muted small">Es tu primera vez como <b id="l-rol-registro"></b>. Estos datos se usan en el SOS y solo se guardan en este teléfono. Puedes cambiarlos después en <b>Perfil</b>.</p>
         <div id="registro-destino"></div>
-        <p class="muted small">Al entrar, el navegador te pedirá tu <b>ubicación</b> para dibujar tus rutas.</p>
+        <button class="link" type="button" data-action="cambiar-usuario">← Cambiar de usuario</button>
+        <p class="muted small">Tu ubicación solo se usa al grabar una ruta, con monitoreo aceptado o con el SOS.</p>
       </div>
 
       <p class="muted small login-pie" id="l-pie"></p>
@@ -51,22 +47,28 @@
   <!-- ===== BARRA SUPERIOR ===== -->
   <header class="topbar">
     <div class="brand"><span class="estrella">✦</span> NOVA</div>
+    <span id="h-monitoreo" hidden></span>
     <button class="usuario-btn" data-action="cuenta" id="btn-cuenta">—</button>
-    <button class="sos-btn" data-action="sos" aria-label="Enviar SOS">SOS</button>
+    <button class="sos-btn" data-action="sos" aria-label="Enviar SOS" data-roles="scout jefe exp">SOS</button>
   </header>
   <!-- Estado discreto, como el contador de FPS de un juego -->
+  <!-- Vista de prueba de dev -->
+  <div id="barra-vista" hidden>🛠 DEV viendo como <b id="bv-rol"></b> · <button type="button" data-action="volver-dev">Volver a dev</button></div>
+
   <div class="hud" id="hud" data-action="hud" title="Estado">
-    <span id="h-monitoreo" hidden></span><!-- primero: siempre visible -->
     <span id="h-gps">GPS --</span>
     <span id="h-net">NET --</span>
     <span id="h-bat">BAT --</span>
     <span id="h-mapa">MAP --</span>
     <span id="h-limite" hidden></span>
+    <span id="h-sim" hidden></span>
+    <span id="h-nube" hidden></span>
   </div>
 
   <main>
     <!-- ===== GRABAR (inicio) ===== -->
     <section id="tab-grabar" class="tab active">
+      <div id="barra-validacion" hidden>Validando: <b id="bval-nombre"></b> · <button type="button" data-action="cancelar-validacion">✕ Cancelar validación</button></div>
       <div class="mapa-envoltura">
         <div id="mapa"></div>
         <div class="mapa-botones">
@@ -88,8 +90,14 @@
         <button class="secondary" id="btn-descanso" data-action="descanso" disabled>Descanso</button>
         <button class="danger" id="btn-terminar" data-action="terminar" disabled>■ Terminar</button>
       </div>
+      <button class="link peligro" id="btn-descartar" data-action="descartar" hidden>✕ Salir sin guardar</button>
+      <div id="sim-control" hidden>
+        <label class="gen-control">Velocidad de la simulación <b id="sim-vel-t">10x</b>
+          <input type="range" id="sim-vel" min="1" max="50" step="1" value="10"></label>
+      </div>
       <div class="extra">
         <button class="secondary" data-action="enviar-ubicacion">📤 Enviar mi ubicación al jefe</button>
+        <button class="secondary" id="btn-pedir-mon" data-action="pedir-monitoreo" data-roles="scout exp">📡 Pedir monitoreo</button>
         <button class="secondary" data-action="guardar-zona" data-roles="dev">⬇ Guardar mapa</button>
         <button class="secondary solo-pruebas" data-action="simular" id="btn-simular">▶ Simular recorrido de prueba</button>
         <p class="muted small">Mientras grabas, el mapa sigue tu posición y la pantalla se mantiene encendida. Toca 🔒 para moverlo libremente.</p>
@@ -100,8 +108,14 @@
     <section id="tab-rutas" class="tab">
       <div id="lista-envoltura">
         <div class="titulo-fila">
-          <h2 class="section-title">✦ MIS RUTAS</h2>
+          <h2 class="section-title" id="t-rutas">✦ MIS RUTAS</h2>
           <button class="link" data-action="importar">📂 Importar</button>
+        </div>
+        <div class="filtros" data-roles="dev">
+          <button type="button" data-filtro="todas" class="activa">Todas</button>
+          <button type="button" data-filtro="reales">Reales</button>
+          <button type="button" data-filtro="prueba">Prueba</button>
+          <button type="button" data-filtro="revisar">Por revisar</button>
         </div>
         <div id="lista-rutas"></div>
       </div>
@@ -140,15 +154,16 @@
     </section>
 
     <!-- ===== JEFE ===== -->
-    <section id="tab-jefe" class="tab" data-roles="jefe dev">
+    <section id="tab-jefe" class="tab" data-roles="jefe">
       <h2 class="section-title">✦ JEFE</h2>
-      <p class="muted small">Nova no tiene servidor: aquí ves al scout que usa este mismo teléfono, solo si acepta el monitoreo.</p>
+      <p class="muted small">Nova no tiene servidor: aquí ves a quien usa este mismo teléfono (scout o experto), solo si acepta el monitoreo. También te pueden pedir monitoreo desde Grabar.</p>
       <div class="card">
         <h2>✦ Monitoreo</h2>
         <div id="j-mon-estado" class="estado-grande">Sin monitoreo activo</div>
         <p class="muted small" id="j-mon-texto"></p>
         <button class="primary" id="j-mon-iniciar" data-action="monitoreo-iniciar">📡 Iniciar monitoreo</button>
         <button class="danger" id="j-mon-terminar" data-action="monitoreo-terminar" hidden>■ Terminar monitoreo</button>
+        <div id="j-mon-solicitud" class="solicitud-mon" hidden></div>
         <p class="aviso-texto" id="j-sos" hidden></p>
         <div id="j-personas"></div>
         <h3>Historial</h3>
@@ -177,7 +192,7 @@
     </section>
 
     <!-- ===== REVISAR (experto) ===== -->
-    <section id="tab-revisar" class="tab" data-roles="exp dev">
+    <section id="tab-revisar" class="tab" data-roles="exp">
       <h2 class="section-title">✦ REVISIÓN</h2>
       <p class="muted small">Aquí llegan las rutas que los scouts envían desde Rutas. Abre una y haz el recorrido de validación. Si la distancia y el desnivel varían 15 % o menos, apruébala con fechas de vigencia y observaciones de seguridad. También puedes rechazarla con una nota.</p>
       <div class="card">
@@ -193,6 +208,7 @@
     <!-- ===== ADMIN (dev) ===== -->
     <section id="tab-admin" class="tab" data-roles="dev">
       <h2 class="section-title">✦ ADMIN</h2>
+      <p class="aviso-texto" id="a-en-curso" hidden></p>
       <div class="card">
         <h2>Contraseñas</h2>
         <p class="muted small">Cambia la contraseña de cada tipo de usuario. La predeterminada es 0000.</p>
@@ -205,6 +221,37 @@
         <p class="muted small">Con el modo pruebas activo, el botón "Simular recorrido" aparece en Grabar.</p>
       </div>
       <div class="card">
+        <h2>Vistas de prueba</h2>
+        <p class="muted small">Cambia la vista sin cerrar sesión, con un perfil de prueba. Lo que crees ahí queda marcado como PRUEBA.</p>
+        <div class="controls tres">
+          <button class="secondary" data-action="ver-como" data-rol="scout">🧒 Ver como Scout</button>
+          <button class="secondary" data-action="ver-como" data-rol="jefe">🧭 Ver como Jefe</button>
+          <button class="secondary" data-action="ver-como" data-rol="exp">🎖 Ver como Experto</button>
+        </div>
+        <button class="link peligro" data-action="borrar-prueba">Borrar datos de prueba</button>
+      </div>
+      <div class="card">
+        <h2>Conexión</h2>
+        <ul class="status"><li><span>Modo actual</span><b id="a-red">—</b></li></ul>
+        <button class="primary" id="btn-red" data-action="alternar-red" style="width:100%">Cambiar a offline</button>
+        <p class="muted small">Offline: Nova no usa internet. El mapa solo muestra la carpeta mapas/ y los mosaicos ya guardados. Online: usa internet cuando hay y guarda los mosaicos que ve. El cambio vale para todos los usuarios de este teléfono.</p>
+      </div>
+      <div class="card">
+        <h2>Nube (Firebase)</h2>
+        <ul class="status"><li><span>Estado</span><b id="n-estado">—</b></li></ul>
+        <label class="campo">Código del grupo (16 o más letras y números)
+          <input id="n-codigo" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="Ej. k7m2p9x4c8v3b6n5q2w7e4r9"></label>
+        <label class="campo">Dirección de la base
+          <input id="n-url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="https://…firebaseio.com"></label>
+        <div class="controls dos">
+          <button class="secondary" data-action="nube-generar">🎲 Código nuevo</button>
+          <button class="secondary" data-action="nube-probar">🔍 Probar</button>
+        </div>
+        <button class="primary" id="btn-nube" data-action="nube-alternar" style="width:100%">Activar la nube</button>
+        <button class="link peligro" data-action="nube-limpiar">Borrar los datos del grupo en la nube</button>
+        <p class="muted small">Con la nube activa, el jefe ve en su teléfono la ubicación, la ruta y el SOS de quien aceptó el monitoreo. Todos los teléfonos del grupo necesitan el <b>mismo código</b>: configúralo en cada uno entrando como dev. Solo se sube lo que el monitoreado aceptó compartir y su SOS; el perfil de salud no se sube. Funciona mientras la app está abierta y con la pantalla encendida.</p>
+      </div>
+      <div class="card">
         <h2>Sistema</h2>
         <ul class="status" id="a-sistema"></ul>
         <button class="link peligro" data-action="borrar-todo">Borrar todos los datos</button>
@@ -213,11 +260,11 @@
   </main>
 
   <nav class="tabbar">
-    <button data-tab="grabar" class="active"><span>⏺</span>Grabar</button>
+    <button data-tab="grabar" class="active" data-roles="scout jefe exp"><span>⏺</span>Grabar</button>
     <button data-tab="rutas"><span>🗂</span>Rutas</button>
     <button data-tab="perfil"><span>👤</span>Perfil</button>
-    <button data-tab="jefe" data-roles="jefe dev"><span>🧭</span>Jefe</button>
-    <button data-tab="revisar" data-roles="exp dev"><span>✅</span>Revisar</button>
+    <button data-tab="jefe" data-roles="jefe"><span>🧭</span>Jefe</button>
+    <button data-tab="revisar" data-roles="exp"><span>✅</span>Revisar</button>
     <button data-tab="admin" data-roles="dev"><span>🛠</span>Admin</button>
   </nav>
 
@@ -262,6 +309,7 @@
   <!-- Ventana emergente genérica -->
   <dialog id="modal">
     <form method="dialog">
+      <button type="button" class="m-cerrar" id="m-cerrar" aria-label="Cerrar">✕</button>
       <h2 id="m-titulo"></h2>
       <div id="m-cuerpo"></div>
       <div class="controls" id="m-botones"></div>
@@ -274,6 +322,7 @@
   <script src="vendor/leaflet/leaflet.js"></script>
   <!-- Índice de los mapas guardados en la carpeta mapas/ (lo crea descargar_mapa.py; si no existe, no pasa nada) -->
   <script src="mapas/indice.js"></script>
+  <script src="nube.js"></script>
   <script src="sesion.js"></script>
   <script src="app.js"></script>
 </body>

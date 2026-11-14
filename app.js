@@ -5,7 +5,7 @@
  */
 'use strict';
 
-const VERSION_APP = 'v2.0.6';
+const VERSION_APP = 'v2.2.0';
 
 /* =========================================================
  * 1. Ajustes y utilidades
@@ -83,7 +83,7 @@ function formatoVelocidad(ms, metros) {
 }
 
 function formatoHace(t) {
-  const min = Math.round((Date.now() - t) / 60000);
+  const min = Math.round((ahora() - t) / 60000);
   if (min < 1) return 'hace menos de 1 min';
   if (min < 60) return `hace ${min} min`;
   const h = Math.floor(min / 60);
@@ -99,6 +99,15 @@ function aviso(texto, duracion = 2800) {
   const t = $('#toast');
   t.textContent = texto;
   t.hidden = false;
+  clearTimeout(aviso._timer);
+  aviso._timer = setTimeout(() => { t.hidden = true; }, duracion);
+}
+
+function avisoConAccion(texto, boton, accion, duracion = 5000) {
+  const t = $('#toast');
+  t.innerHTML = `<span>${escapar(texto)}</span> <button type="button" class="toast-boton">${escapar(boton)}</button>`;
+  t.hidden = false;
+  t.querySelector('button').addEventListener('click', () => { t.hidden = true; clearTimeout(aviso._timer); accion(); }, { once: true });
   clearTimeout(aviso._timer);
   aviso._timer = setTimeout(() => { t.hidden = true; }, duracion);
 }
@@ -153,6 +162,7 @@ const DB = {
   },
   guardarAjuste: (clave, valor) => DB._tx('ajustes', 'readwrite', (s) => s.put(valor, clave)),
   leerAjuste: (clave) => DB._tx('ajustes', 'readonly', (s) => s.get(clave)),
+  borrarAjuste: (clave) => DB._tx('ajustes', 'readwrite', (s) => s.delete(clave)),
   borrarTodo: () => Promise.all([
     DB._tx('rutas', 'readwrite', (s) => s.clear()),
     DB._tx('ajustes', 'readwrite', (s) => s.clear()),
@@ -174,9 +184,14 @@ const estado = {
   sos: null,               // { activo, t, lat, lng, rol }
   bateria: null,           // { nivel, cargando } de este teléfono
   personaJefe: null,       // rol que el jefe tiene abierto en Monitoreo activo
+  generado: null,          // recorrido generado por dev (vista previa)
   monitoreo: null,         // ajuste 'monitoreo' (ver 8b)
   rutaAbierta: null,       // ruta mostrada en el detalle
   simulador: null,
+  sosRemoto: null,         // SOS de otro teléfono (nube); no se guarda
+  modoRed: 'online',       // ajuste 'modoRed': 'online' u 'offline' (lo cambia dev en Admin)
+  simInicio: null,         // [lat, lng] elegido para empezar el recorrido inventado
+  eligiendoInicio: null,   // { modo, datos } mientras se espera el toque en el mapa
   ultimoGuardado: 0,
   saltosIgnorados: 0,
   ocultaDesde: null,       // momento en que la app pasó a segundo plano
@@ -194,6 +209,29 @@ const estado = {
  * El Service Worker guarda los mosaicos que ya se vieron.
  */
 const ABIERTA_COMO_ARCHIVO = location.protocol === 'file:';
+
+/* Modo de conexión. En 'offline' Nova no usa internet: el Service Worker solo entrega
+ * mosaicos guardados y archivos de la carpeta mapas/. Lo cambia dev en Admin. */
+function esOffline() { return estado.modoRed === 'offline'; }
+
+function avisarModoRedAlSW() {
+  if (!('serviceWorker' in navigator) || ABIERTA_COMO_ARCHIVO) return;
+  navigator.serviceWorker.ready.then((reg) => {
+    const sw = reg.active || navigator.serviceWorker.controller;
+    if (sw) sw.postMessage({ tipo: 'modo-red', modo: estado.modoRed });
+  });
+}
+
+async function alternarModoRed() {
+  if (!Sesion.esDev()) return;
+  estado.modoRed = esOffline() ? 'online' : 'offline';
+  await DB.guardarAjuste('modoRed', estado.modoRed);
+  avisarModoRedAlSW();
+  Nube.revisar();
+  pintarHud();
+  refrescarAdmin();
+  aviso(esOffline() ? 'Modo offline: Nova no usará internet' : 'Modo online activado');
+}
 const MAPA_LOCAL = window.MAPA_LOCAL || null;
 const CENTRO_INICIAL = (MAPA_LOCAL && MAPA_LOCAL.centro) || [19.5800, -99.0700]; // Sierra de Guadalupe
 
@@ -214,7 +252,11 @@ function hayMosaicoLocal(z, x, y) {
 function urlsMosaico(z, x, y) {
   const urls = [];
   if (hayMosaicoLocal(z, x, y)) urls.push({ url: FUENTES.local(z, x, y), claro: !LOCAL_OSCURO });
-  if (!ABIERTA_COMO_ARCHIVO) urls.push({ url: FUENTES.osm(z, x, y), claro: true });
+  // En offline el Service Worker solo entrega mosaicos guardados; si todavía no
+  // controla la página, no se intenta internet desde aquí.
+  const controlado = !!(navigator.serviceWorker && navigator.serviceWorker.controller);
+  const internetPermitido = !esOffline() || controlado;
+  if (!ABIERTA_COMO_ARCHIVO && internetPermitido) urls.push({ url: FUENTES.osm(z, x, y), claro: true });
   return urls;
 }
 
@@ -275,6 +317,14 @@ function mapaGrabar() {
     mapas.precision = L.circle(CENTRO_INICIAL, { radius: 0, color: '#1f4d3a', weight: 1, fillOpacity: 0.1 });
     mapas.seguir = true;
     aplicarBloqueo();
+    // Si se está eligiendo el inicio de la simulación, el toque en el mapa lo fija
+    mapas.grabar.on('click', (e) => {
+      const espera = estado.eligiendoInicio;
+      if (!espera) return;
+      estado.eligiendoInicio = null;
+      fijarInicioSim([e.latlng.lat, e.latlng.lng]);
+      abrirSimulacion(espera.modo, espera.datos);
+    });
   }
   return mapas.grabar;
 }
@@ -288,18 +338,29 @@ function hud(id, texto, clase = '') {
 }
 
 function pintarHud() {
-  hud('net', navigator.onLine ? 'NET ON' : 'NET OFF', navigator.onLine ? 'info' : 'medio');
+  if (esOffline()) hud('net', 'MODO OFFLINE', 'medio');
+  else hud('net', navigator.onLine ? 'NET ON' : 'NET OFF', navigator.onLine ? 'info' : 'medio');
+  const cfgNube = Nube.config();
+  $('#h-nube').hidden = !cfgNube.activa;
+  if (cfgNube.activa) {
+    const conexion = Nube.estado().conexion;
+    if (esOffline()) hud('nube', 'NUBE PAUSA', 'medio');
+    else if (conexion === 'conectada') hud('nube', 'NUBE ON', 'info');
+    else if (conexion === 'error') hud('nube', 'NUBE ERR', 'mal');
+    else hud('nube', 'NUBE …', 'medio');
+  }
   const lim = $('#h-limite');
   if (estado.horaLimite) {
     lim.hidden = false;
-    const vencida = Date.now() > estado.horaLimite;
+    const vencida = ahora() > estado.horaLimite;
     hud('limite', `⏰ ${formatoHora(estado.horaLimite)}`, vencida ? 'mal' : 'info');
   } else {
     lim.hidden = true;
   }
-  const mon = $('#h-monitoreo');
+  pintarBotonMonitoreo();
+  const mon = $('#h-monitoreo'); // en la barra superior: se ve en todas las pestañas
   mon.hidden = !monitoreoActivo();
-  if (!mon.hidden) hud('monitoreo', '📡 MONITOREO', 'ok');
+  if (!mon.hidden) mon.textContent = '📡 MONITOREO';
 }
 
 function detalleEstado() {
@@ -389,6 +450,7 @@ function guardarZona() {
       [{ texto: 'Entendido', clase: 'primary' }]);
     return;
   }
+  if (esOffline()) { aviso('Modo offline: cámbialo a online en Admin para guardar el mapa'); return; }
   if (!navigator.onLine) { aviso('Necesitas internet para guardar la zona'); return; }
   const mapa = mapaGrabar();
   const zMin = Math.max(12, Math.min(mapa.getZoom() - 1, ZOOM_MAX_GUARDADO));
@@ -414,7 +476,7 @@ async function descargarZona(lista) {
   abrirModal('Guardando mapa…', `
     <progress id="f-progreso" max="${lista.length}" value="0"></progress>
     <p class="muted small" id="f-progreso-texto">0 de ${lista.length}</p>`,
-  [{ texto: 'Cancelar', clase: 'secondary', accion: () => { cancelado = true; } }]);
+  [{ texto: 'Cancelar', clase: 'secondary', accion: () => { cancelado = true; } }], { cerrable: false });
 
   const cache = await caches.open(CACHE_MAPA);
   const pendientes = lista.slice();
@@ -461,7 +523,8 @@ function iniciarGPS() {
   }
   if (idWatch !== null || estado.simulador) return;
   idWatch = navigator.geolocation.watchPosition(
-    (p) => recibirPosicion(p.coords.latitude, p.coords.longitude, p.coords.accuracy, p.timestamp, p.coords.altitude),
+    // Con el reloj virtual activo, la hora del punto es la simulada
+    (p) => recibirPosicion(p.coords.latitude, p.coords.longitude, p.coords.accuracy, reloj.activo ? ahora() : p.timestamp, p.coords.altitude),
     (err) => {
       const textos = { 1: 'sin permiso', 2: 'sin señal', 3: 'buscando…' };
       hud('gps', `GPS ${(textos[err.code] || 'error').toUpperCase()}`, 'mal');
@@ -489,7 +552,7 @@ async function recibirPosicion(lat, lng, precision, t, alt = null) {
   if (mapas.seguir) mapa.setView(punto, Math.max(mapa.getZoom(), 16), { animate: false });
 
   // Última ubicación conocida, para la vista del jefe (cada 15 s como máximo)
-  if (t - estado.ultimoGuardado > 15000) {
+  if (t - estado.ultimoGuardado > 15000 || t < estado.ultimoGuardado) { // o si el reloj regresó
     estado.ultimoGuardado = t;
     await compartirUbicacion(estado.posicion);
     if (estado.grabacion) await DB.guardarRuta(estado.grabacion);
@@ -513,17 +576,32 @@ async function recibirPosicion(lat, lng, precision, t, alt = null) {
   actualizarPanelGrabar();
 }
 
-/* Descanso automático: si en el último minuto te moviste menos de 15 m */
 /* Guarda la ubicación, batería y nombre para la vista del jefe.
  * SOLO si quien usa la app aceptó el monitoreo (ver 8b). */
 async function compartirUbicacion(p) {
-  if (!p || !soyMonitoreado()) return;
-  await DB.guardarAjuste('ultimaUbicacion', {
+  if (!p) return;
+  const m = estado.monitoreo;
+  // Quien pide monitoreo manda su ubicación con la solicitud (lo decidió al pedirlo)
+  if (m && m.estado === 'pendiente' && m.origen === 'monitoreado' && soyElMonitoreado(m)) {
+    m.ubicacion = { lat: p.lat, lng: p.lng, precision: p.precision, t: p.t };
+    await guardarMonitoreo(m);
+    return;
+  }
+  if (!soyMonitoreado()) return;
+  const registro = {
     lat: p.lat, lng: p.lng, precision: p.precision, t: p.t,
-    rol: Sesion.rol, nombre: estado.perfil.nombre || '', bateria: estado.bateria,
-  });
+    rol: Sesion.actual(), nombre: estado.perfil.nombre || '', bateria: estado.bateria, prueba: !!m.prueba,
+  };
+  await DB.guardarAjuste('ultimaUbicacion', registro);
+  subirUbicacionNube(registro);
 }
 
+/* Avisa al instante (si hay monitoreo activo) que cambió el estado de la ruta */
+function avisarCambioRuta() {
+  try { if (estado.posicion) compartirUbicacion(estado.posicion); } catch (e) { /* no debe romper la ruta */ }
+}
+
+/* Descanso automático: si en el último minuto te moviste menos de 15 m */
 function revisarDescansoAutomatico(t) {
   const ruta = estado.grabacion;
   const pos = [estado.posicion.lat, estado.posicion.lng];
@@ -546,14 +624,15 @@ function revisarDescansoAutomatico(t) {
   }
 }
 
-function abrirDescanso(tipo, inicio = Date.now()) {
+function abrirDescanso(tipo, inicio = ahora()) {
   if (!estado.posicion) { aviso('Espera la señal de GPS'); return; }
   estado.descansoActual = { inicio, tipo, punto: [estado.posicion.lat, estado.posicion.lng] };
   $('#btn-descanso').textContent = 'Seguir';
   actualizarPanelGrabar();
+  avisarCambioRuta();
 }
 
-function cerrarDescanso(fin = Date.now()) {
+function cerrarDescanso(fin = ahora()) {
   const d = estado.descansoActual;
   if (!d) return;
   estado.grabacion.tiempos.paradas.push({
@@ -562,6 +641,7 @@ function cerrarDescanso(fin = Date.now()) {
   estado.descansoActual = null;
   $('#btn-descanso').textContent = 'Descanso';
   actualizarPanelGrabar();
+  avisarCambioRuta();
 }
 
 /* Paradas para rutas importadas: quieto (menos de 15 m) durante al menos 1 minuto */
@@ -607,7 +687,7 @@ document.addEventListener('visibilitychange', () => {
     return;
   }
   compartirUbicacion(estado.posicion);
-  pedirConsentimiento();
+  revisarSolicitudes();
   if (estado.modo === 'grabando') {
     mantenerPantalla(true);
     const fuera = estado.ocultaDesde ? Date.now() - estado.ocultaDesde : 0;
@@ -628,13 +708,13 @@ window.addEventListener('pagehide', () => {
  * 7. Registro de ruta
  * ========================================================= */
 function tiempoActivo() {
-  if (estado.modo === 'grabando') return estado.acumuladoMs + (Date.now() - estado.inicioTramo);
+  if (estado.modo === 'grabando') return estado.acumuladoMs + (ahora() - estado.inicioTramo);
   return estado.acumuladoMs;
 }
 
-function tiempoDescansos(ruta, ahora = Date.now()) {
+function tiempoDescansos(ruta, momento = ahora()) {
   let total = ruta.tiempos.paradas.reduce((s, p) => s + (p.fin - p.inicio), 0);
-  if (estado.descansoActual && estado.grabacion && ruta.id === estado.grabacion.id) total += ahora - estado.descansoActual.inicio;
+  if (estado.descansoActual && estado.grabacion && ruta.id === estado.grabacion.id) total += momento - estado.descansoActual.inicio;
   return total;
 }
 
@@ -644,43 +724,46 @@ function iniciarRuta(validar = null) {
   iniciarGPS(); // por si se cerró la bienvenida sin dar permiso
   if (estado.modo === 'pausada') {
     estado.modo = 'grabando';
-    estado.inicioTramo = Date.now();
+    estado.inicioTramo = ahora();
     mantenerPantalla(true);
     actualizarBotones();
+    avisarCambioRuta();
     return;
   }
-  const ahora = Date.now();
+  const inicio = ahora();
   estado.grabacion = {
-    id: `ruta-${ahora}`,
-    nombre: `Ruta del ${formatoFecha(ahora)}`,
+    id: `ruta-${inicio}`,
+    nombre: `Ruta del ${formatoFecha(inicio)}`,
     tipo: 'cerro',
     coordenadas: [],
-    tiempos: { inicio: ahora, fin: null, paradas: [], activoMs: 0 },
+    tiempos: { inicio, fin: null, paradas: [], activoMs: 0 },
     estado: 'en curso',
-    autor: { rol: Sesion.rol, nombre: estado.perfil.nombre || '' },
+    autor: { rol: Sesion.actual(), nombre: estado.perfil.nombre || '' },
   };
+  if (Sesion.vista) estado.grabacion.prueba = true;
   if (validar) {
     estado.grabacion.validacionDe = validar.id;
     estado.grabacion.nombre = `Validación: ${validar.nombre}`;
     estado.grabacion.tipo = validar.tipo;
   }
   estado.modo = 'grabando';
-  estado.inicioTramo = ahora;
+  estado.inicioTramo = inicio;
   estado.acumuladoMs = 0;
   estado.descansoActual = null;
   estado.saltosIgnorados = 0;
   mapaGrabar();
   mapas.linea.setLatLngs([]);
   bloquearMapa(true);
-  if (estado.posicion && Date.now() - estado.posicion.t < 30000 && estado.posicion.precision <= PRECISION_MAXIMA) {
+  if (estado.posicion && ahora() - estado.posicion.t < 30000 && estado.posicion.precision <= PRECISION_MAXIMA) {
     const p = estado.posicion;
-    estado.grabacion.coordenadas.push([p.lat, p.lng, ahora, p.alt === null || p.alt === undefined ? null : Math.round(p.alt)]);
+    estado.grabacion.coordenadas.push([p.lat, p.lng, inicio, p.alt === null || p.alt === undefined ? null : Math.round(p.alt)]);
     mapas.linea.addLatLng([p.lat, p.lng]);
   }
   DB.guardarRuta(estado.grabacion);
   pintarGuia(estado.grabacion.validacionDe);
   mantenerPantalla(true);
   actualizarBotones();
+  avisarCambioRuta();
   aviso(validar ? 'Grabando recorrido de validación' : 'Grabando ruta');
 }
 
@@ -693,6 +776,7 @@ function pausarRuta() {
   DB.guardarRuta(estado.grabacion);
   mantenerPantalla(false);
   actualizarBotones();
+  avisarCambioRuta();
 }
 
 function alternarDescanso() {
@@ -721,14 +805,16 @@ function terminarRuta() {
     <p class="muted small">${formatoKm(distanciaRuta(ruta.coordenadas))} · ${formatoTiempo(estado.acumuladoMs)} · ${ruta.tiempos.paradas.length} descansos</p>`,
   [
     { texto: 'Seguir grabando', clase: 'secondary', accion: () => iniciarRuta() },
+    { texto: 'Descartar', clase: 'danger', accion: () => salirSinGuardar() },
     { texto: 'Guardar', clase: 'primary', accion: async () => {
       ruta.nombre = $('#f-nombre').value.trim() || ruta.nombre;
       ruta.tipo = $('#f-tipo').value;
-      ruta.tiempos.fin = Date.now();
+      ruta.tiempos.fin = ahora();
       ruta.tiempos.activoMs = estado.acumuladoMs;
       ruta.estado = ruta.validacionDe ? 'validacion' : 'terminada';
       await DB.guardarRuta(ruta);
       detenerSimulador();
+      apagarReloj(); // ahora() vuelve a ser Date.now()
       estado.grabacion = null;
       estado.modo = 'detenida';
       estado.acumuladoMs = 0;
@@ -742,6 +828,79 @@ function terminarRuta() {
   ]);
 }
 
+/* ---------- Salir sin guardar ---------- */
+/* Quita la ruta en curso sin guardarla; devuelve una copia para "Deshacer" */
+async function descartarGrabacion() {
+  const ruta = estado.grabacion;
+  if (!ruta) return null;
+  ruta.tiempos.activoMs = tiempoActivo();
+  const copia = JSON.parse(JSON.stringify(ruta));
+  detenerSimulador();
+  mantenerPantalla(false);
+  estado.descansoActual = null;
+  await DB.borrarRuta(ruta.id);
+  estado.grabacion = null;
+  estado.modo = 'detenida';
+  estado.acumuladoMs = 0;
+  if (mapas.linea) mapas.linea.setLatLngs([]);
+  pintarGuia(null);
+  apagarReloj();
+  actualizarBotones();
+  apagarGPSSiSobra();
+  return copia;
+}
+
+async function restaurarGrabacion(copia) {
+  if (estado.grabacion) { aviso('Ya hay otra ruta en curso'); return; }
+  copia.estado = 'en curso';
+  await DB.guardarRuta(copia);
+  estado.grabacion = copia;
+  estado.modo = 'pausada';
+  estado.acumuladoMs = copia.tiempos.activoMs || 0;
+  mapaGrabar();
+  mapas.linea.setLatLngs(copia.coordenadas.map((c) => [c[0], c[1]]));
+  pintarGuia(copia.validacionDe);
+  actualizarBotones();
+  await refrescarTodo();
+  aviso('Ruta restaurada (en pausa)');
+}
+
+/* Pide confirmación (excepto a dev, que descarta al instante con "Deshacer") */
+function salirSinGuardar(despues = null) {
+  const ruta = estado.grabacion;
+  if (!ruta) return;
+  const km = formatoKm(distanciaRuta(ruta.coordenadas));
+  const hacer = async () => {
+    const copia = await descartarGrabacion();
+    await refrescarTodo();
+    if (despues) await despues(copia);
+    if (Sesion.esDev()) avisoConAccion(`Ruta descartada (${km})`, 'Deshacer', () => restaurarGrabacion(copia));
+    else aviso('Ruta descartada');
+  };
+  if (Sesion.esDev()) { hacer(); return; }
+  abrirModal('Salir sin guardar', `<p>Se perderá el recorrido de <b>${km}</b>.</p>`, [
+    { texto: 'Seguir grabando', clase: 'secondary' },
+    { texto: 'Salir sin guardar', clase: 'danger', accion: hacer },
+  ]);
+}
+
+/* 4b. Cancelar la validación: descarta el recorrido y vuelve a la ruta original */
+function cancelarValidacion() {
+  if (!estado.grabacion || !estado.grabacion.validacionDe) return;
+  salirSinGuardar(async (copia) => {
+    irATab('rutas');
+    estado.volverA = 'revisar';
+    await abrirDetalle(copia.validacionDe);
+  });
+}
+
+function pintarBarraValidacion() {
+  const ruta = estado.grabacion;
+  const barra = $('#barra-validacion');
+  barra.hidden = !(ruta && ruta.validacionDe);
+  if (!barra.hidden) $('#bval-nombre').textContent = ruta.nombre.replace(/^Validación: /, '');
+}
+
 function actualizarBotones() {
   const m = estado.modo;
   $('#btn-iniciar').disabled = m === 'grabando';
@@ -750,6 +909,8 @@ function actualizarBotones() {
   $('#btn-descanso').disabled = m !== 'grabando';
   $('#btn-descanso').textContent = estado.descansoActual ? 'Seguir' : 'Descanso';
   $('#btn-terminar').disabled = m === 'detenida';
+  $('#btn-descartar').hidden = !estado.grabacion;
+  pintarBarraValidacion();
   actualizarPanelGrabar();
 }
 
@@ -776,14 +937,14 @@ function actualizarPanelGrabar() {
   $('#g-ritmo').textContent = formatoRitmo(enMovimiento, dist);
   $('#g-paradas').textContent = ruta.tiempos.paradas.length + (estado.descansoActual ? 1 : 0);
 
-  if (estado.horaLimite && Date.now() > estado.horaLimite) {
+  if (estado.horaLimite && ahora() > estado.horaLimite) {
     banner.textContent = `⚠ Pasó la hora límite (${formatoHora(estado.horaLimite)})`;
     banner.className = 'banner alerta';
   } else if (estado.modo === 'pausada') {
     banner.textContent = 'En pausa';
     banner.className = 'banner pausa';
   } else if (estado.descansoActual) {
-    banner.textContent = `Descanso ${estado.descansoActual.tipo === 'manual' ? 'manual' : 'automático'} · ${formatoTiempo(Date.now() - estado.descansoActual.inicio)}`;
+    banner.textContent = `Descanso ${estado.descansoActual.tipo === 'manual' ? 'manual' : 'automático'} · ${formatoTiempo(ahora() - estado.descansoActual.inicio)}`;
     banner.className = 'banner pausa';
   } else if (gpsDebil) {
     banner.textContent = `Grabando · señal de GPS débil (±${Math.round(estado.posicion.precision)} m)`;
@@ -801,7 +962,7 @@ function actualizarPanelGrabar() {
 /* Solo el jefe (y dev) la define: al iniciar el monitoreo o aquí, con el
  * monitoreo activo. Las alertas le saltan al scout monitoreado. */
 function definirHoraLimite() {
-  if (!['jefe', 'dev'].includes(Sesion.rol)) return;
+  if (!Sesion.puede('jefe dev') && !Sesion.esDev()) return;
   if (!monitoreoActivo()) { aviso('Primero inicia un monitoreo'); return; }
   const quien = $('#j-nombre').textContent || 'la persona';
   const actual = estado.horaLimite ? new Date(estado.horaLimite).toTimeString().slice(0, 5) : '';
@@ -833,7 +994,7 @@ function revisarHoraLimite() {
   if (!estado.horaLimite || estado.modo === 'detenida') return;
   // Las alertas son para el scout monitoreado; al jefe se le muestra en su pestaña
   if (!soyMonitoreado()) return;
-  const falta = estado.horaLimite - Date.now();
+  const falta = estado.horaLimite - ahora();
   if (falta <= 15 * 60 * 1000 && falta > 0 && !estado.avisoLimite.previo) {
     estado.avisoLimite.previo = true;
     alertar('Faltan 15 minutos', `Tu hora límite de regreso es a las ${formatoHora(estado.horaLimite)}. Empieza a regresar.`);
@@ -873,38 +1034,70 @@ function alertar(titulo, texto) {
 }
 
 /* =========================================================
- * 8b. Monitoreo con consentimiento
+ * 8b. Monitoreo con consentimiento (en dos direcciones)
  * =========================================================
- * Ajuste 'monitoreo': { estado: 'pendiente'|'activo'|'rechazado'|'terminado',
- *   jefe, horaLimite, solicitado, aceptado, rechazado, terminado, persona }
- * Cada evento es { t, por: { rol, nombre } }. Los monitoreos anteriores se
- * guardan en 'monitoreoHistorial' (los 10 más recientes).
- * Sin monitoreo activo NO se guarda 'ultimaUbicacion'. El SOS funciona siempre.
+ * Ajuste 'monitoreo':
+ *   { estado: 'pendiente'|'activo'|'rechazado'|'terminado',
+ *     origen: 'jefe'|'monitoreado',      quién lo pidió
+ *     monitoreado: { rol, nombre },       scout o exp
+ *     jefe: { rol, nombre } | null,       quién monitorea
+ *     motivo, horaLimite, ubicacion (solo mientras lo pide el monitoreado),
+ *     solicitado, aceptado, rechazado, terminado,   eventos { t, por }
+ *     prueba }                            creado por dev (vistas de prueba)
+ * Nadie es monitoreado sin su consentimiento: el otro lado siempre puede
+ * rechazar. Sin monitoreo activo NO se guarda 'ultimaUbicacion'.
+ * El SOS funciona siempre. Historial: 'monitoreoHistorial' (10 más recientes).
  */
-const yo = () => ({ rol: Sesion.rol, nombre: estado.perfil.nombre || '' });
+const yo = () => ({ rol: Sesion.actual(), nombre: estado.perfil.nombre || '' });
 const textoQuien = (q) => {
   if (!q) return '—';
   const tipo = ROLES[q.rol] ? ROLES[q.rol].nombre : q.rol;
   return q.nombre ? `${q.nombre} (${tipo})` : tipo;
 };
+const ROLES_MONITOREABLES = ['scout', 'exp'];
+const esMonitoreable = (rol) => ROLES_MONITOREABLES.includes(rol);
 const monitoreoActivo = () => !!(estado.monitoreo && estado.monitoreo.estado === 'activo');
 const monitoreoAbierto = () => !!(estado.monitoreo && ['pendiente', 'activo'].includes(estado.monitoreo.estado));
-const esMonitoreable = (rol) => !!rol && rol !== 'jefe' && rol !== 'dev';
-const soyMonitoreado = () => monitoreoActivo() && Sesion.rol === estado.monitoreo.persona;
+// Los monitoreos de prueba (de dev) solo se cruzan con sesiones de dev, y los reales con las reales
+const mismoMundo = (m) => !!m && !!m.prueba === Sesion.esDev();
+const soyElMonitoreado = (m = estado.monitoreo) => !!m && !!m.monitoreado &&
+  m.monitoreado.rol === Sesion.actual() && mismoMundo(m);
+const soyMonitoreado = () => monitoreoActivo() && soyElMonitoreado();
+const pareceperdido = (motivo) => /perd|extravi|no s[eé] (por )?d[oó]nde|desorient/i.test(motivo || '');
+const chipPrueba = (x) => (x && x.prueba ? ' <span class="chip prueba">PRUEBA</span>' : '');
 
 /* Convierte "HH:MM" en la próxima vez que llegue esa hora */
 function horaProxima(valor) {
   const [h, m] = valor.split(':').map(Number);
-  const fecha = new Date();
+  const fecha = new Date(ahora());
   fecha.setHours(h, m, 0, 0);
-  if (fecha.getTime() < Date.now()) fecha.setDate(fecha.getDate() + 1); // si ya pasó, es mañana
+  if (fecha.getTime() < ahora()) fecha.setDate(fecha.getDate() + 1); // si ya pasó, es mañana
   return fecha.getTime();
+}
+
+/* Monitoreos guardados por la versión 2.0.6 (con "persona") */
+function normalizarMonitoreo(m) {
+  if (!m) return null;
+  if (!m.monitoreado && m.persona) {
+    m.monitoreado = { rol: m.persona, nombre: m.aceptado && m.aceptado.por ? m.aceptado.por.nombre : '' };
+  }
+  if (!m.origen) m.origen = 'jefe';
+  return m;
 }
 
 async function guardarMonitoreo(m) {
   estado.monitoreo = m;
   await DB.guardarAjuste('monitoreo', m);
+  subirMonitoreoNube(m);
   pintarHud();
+}
+
+async function archivarMonitoreo() {
+  const anterior = estado.monitoreo;
+  if (!anterior) return;
+  delete anterior.ubicacion;
+  const historial = (await DB.leerAjuste('monitoreoHistorial')) || [];
+  await DB.guardarAjuste('monitoreoHistorial', [anterior, ...historial].slice(0, 10));
 }
 
 async function aplicarHoraLimite(t) {
@@ -916,123 +1109,170 @@ async function aplicarHoraLimite(t) {
 
 /* Apaga el GPS si ya nada lo necesita (sin ruta, sin simulador y sin monitoreo propio) */
 function apagarGPSSiSobra() {
-  if (idWatch === null || estado.modo !== 'detenida' || estado.simulador || soyMonitoreado()) return;
+  const pidiendo = estado.monitoreo && estado.monitoreo.estado === 'pendiente' &&
+    estado.monitoreo.origen === 'monitoreado' && soyElMonitoreado();
+  if (idWatch === null || estado.modo !== 'detenida' || estado.simulador || soyMonitoreado() || pidiendo) return;
   navigator.geolocation.clearWatch(idWatch);
   idWatch = null;
   hud('gps', 'GPS --');
 }
 
-/* ---------- Jefe ---------- */
+function nuevoMonitoreo(datos) {
+  return {
+    estado: 'pendiente', jefe: null, monitoreado: null, motivo: '', horaLimite: null,
+    solicitado: { t: Date.now(), por: yo() }, aceptado: null, rechazado: null, terminado: null,
+    prueba: Sesion.esDev(), ...datos,
+  };
+}
+
+/* ---------- El jefe lo pide ---------- */
 function iniciarMonitoreo() {
   if (!Sesion.puede('jefe dev')) return;
   if (monitoreoAbierto()) { aviso('Ya hay un monitoreo pendiente o activo'); return; }
   abrirModal('📡 Iniciar monitoreo', `
-    <p class="small">El scout recibe una solicitud y <b>debe aceptarla</b>. Mientras esté activo verás su ubicación, el estado de su ruta y la hora límite.</p>
-    <p class="muted small">Solo tú (o dev) lo puedes terminar.</p>
-    <label>Hora límite de regreso (opcional)<input type="time" id="f-mon-limite"></label>`,
+    <p class="small">La persona recibe una solicitud y <b>puede aceptarla o rechazarla</b>. Si acepta, verás su ubicación, el estado de su ruta y la hora límite.</p>
+    <label>¿A quién?
+      <select id="f-mon-rol">${ROLES_MONITOREABLES.map((r) => `<option value="${r}">${ROLES[r].icono} ${ROLES[r].nombre}</option>`).join('')}</select>
+    </label>
+    <label>Hora límite de regreso (opcional)<input type="time" id="f-mon-limite"></label>
+    <p class="muted small">Solo el jefe (o dev) lo puede terminar.${Sesion.esDev() ? ' Es un monitoreo de PRUEBA.' : ''}</p>`,
   [
     { texto: 'Cancelar', clase: 'secondary' },
     { texto: 'Enviar solicitud', clase: 'primary', accion: async () => {
       const valor = $('#f-mon-limite').value;
-      const anterior = estado.monitoreo;
-      if (anterior) {
-        const historial = (await DB.leerAjuste('monitoreoHistorial')) || [];
-        await DB.guardarAjuste('monitoreoHistorial', [anterior, ...historial].slice(0, 10));
-      }
-      await guardarMonitoreo({
-        estado: 'pendiente',
-        jefe: yo(),
+      const rol = $('#f-mon-rol').value;
+      await archivarMonitoreo();
+      await guardarMonitoreo(nuevoMonitoreo({
+        origen: 'jefe', jefe: yo(), monitoreado: { rol, nombre: '' },
         horaLimite: valor ? horaProxima(valor) : null,
-        solicitado: { t: Date.now(), por: yo() },
-        aceptado: null,
-        rechazado: null,
-        terminado: null,
-        persona: null,
-      });
+      }));
       refrescarJefe();
-      aviso('Solicitud enviada: el scout la verá al entrar');
+      aviso(`Solicitud enviada: la verá ${ROLES[rol].nombre} al entrar`);
     } },
   ]);
 }
 
-function terminarMonitoreo() {
+/* ---------- El monitoreado lo pide (scout o exp, desde Grabar) ---------- */
+function pedirMonitoreo() {
   const m = estado.monitoreo;
-  if (!Sesion.puede('jefe dev') || !monitoreoAbierto()) return;
-  const pendiente = m.estado === 'pendiente';
-  abrirModal(pendiente ? 'Cancelar solicitud' : 'Terminar monitoreo', pendiente
-    ? '<p>La solicitud se cancela y el scout ya no la verá.</p>'
-    : `<p>Dejarás de ver la ubicación de <b>${escapar(textoQuien(m.aceptado && m.aceptado.por))}</b>. Se borra su última ubicación guardada y la hora límite.</p>`,
+  if (!esMonitoreable(Sesion.actual())) return;
+  if (monitoreoAbierto() && soyElMonitoreado()) {
+    if (m.estado === 'activo') {
+      abrirModal('📡 Monitoreo activo', `<p>${escapar(textoQuien(m.jefe))} ve tu ubicación. Solo el jefe lo puede terminar.</p>`,
+        [{ texto: 'Entendido', clase: 'primary' }]);
+    } else if (m.origen === 'jefe') {
+      pedirConsentimiento();
+    } else {
+      abrirModal('📡 Solicitud enviada', '<p class="small">Esperando a que el jefe la acepte o la rechace.</p>', [
+        { texto: 'Cerrar', clase: 'secondary' },
+        { texto: 'Cancelar solicitud', clase: 'danger', accion: () => cerrarMonitoreo('cancelar') },
+      ]);
+    }
+    return;
+  }
+  if (monitoreoAbierto()) { aviso('Hay otro monitoreo en curso en este teléfono'); return; }
+  abrirModal('📡 Pedir monitoreo', `
+    <p class="small">Tu jefe recibe la solicitud con tu nombre, el motivo y tu ubicación, y decide si acepta. Si acepta, verá tu ubicación hasta que él lo termine.</p>
+    <label>Motivo (opcional)<input id="f-mon-motivo" maxlength="120" placeholder="Ej. voy solo, creo que me perdí"></label>
+    <label>Hora límite de regreso (opcional)<input type="time" id="f-mon-limite"></label>
+    <p class="muted small">Si estás en peligro usa el SOS: funciona siempre, sin esperar a nadie.</p>`,
   [
-    { texto: 'No', clase: 'secondary' },
-    { texto: pendiente ? 'Cancelar solicitud' : 'Terminar', clase: 'danger', accion: async () => {
-      m.estado = 'terminado';
-      m.terminado = { t: Date.now(), por: yo() };
-      await guardarMonitoreo(m);
-      await aplicarHoraLimite(null);
-      await DB.guardarAjuste('ultimaUbicacion', null);
-      apagarGPSSiSobra();
-      refrescarJefe();
-      aviso(pendiente ? 'Solicitud cancelada' : 'Monitoreo terminado');
+    { texto: 'Cancelar', clase: 'secondary' },
+    { texto: 'Enviar solicitud', clase: 'primary', accion: async () => {
+      const motivo = $('#f-mon-motivo').value.trim();
+      const valor = $('#f-mon-limite').value;
+      await archivarMonitoreo();
+      const p = estado.posicion;
+      await guardarMonitoreo(nuevoMonitoreo({
+        origen: 'monitoreado', monitoreado: yo(), motivo,
+        horaLimite: valor ? horaProxima(valor) : null,
+        ubicacion: p ? { lat: p.lat, lng: p.lng, precision: p.precision, t: p.t } : null,
+      }));
+      iniciarGPS(); // para mandarle al jefe tu ubicación con la solicitud
+      pintarBotonMonitoreo();
+      if (pareceperdido(motivo)) {
+        abrirModal('Solicitud enviada', '<p>Si crees que estás perdido y corres peligro, <b>usa el SOS ahora</b>: avisa a tu contacto y a tu jefe sin esperar a que acepten.</p>', [
+          { texto: 'Cerrar', clase: 'secondary' },
+          { texto: '🆘 Abrir SOS', clase: 'danger', accion: () => abrirSOS() },
+        ]);
+      } else {
+        aviso('Solicitud enviada a tu jefe');
+      }
     } },
   ]);
 }
 
-function eventosMonitoreo(m) {
-  const terminado = m.aceptado ? 'Terminado' : 'Cancelado';
-  return [['Iniciado', m.solicitado], ['Aceptado', m.aceptado], ['Rechazado', m.rechazado], [terminado, m.terminado]]
-    .filter(([, e]) => e)
-    .map(([accion, e]) => `<li><b>${accion}</b> por ${escapar(textoQuien(e.por))} · ${formatoFecha(e.t)}, ${formatoHora(e.t)}</li>`)
-    .join('');
-}
-
-async function pintarMonitoreoJefe() {
+/* Botón de Grabar según el estado del monitoreo */
+function pintarBotonMonitoreo() {
+  const boton = $('#btn-pedir-mon');
+  if (!boton) return;
   const m = estado.monitoreo;
-  const est = m ? m.estado : null;
-  const textos = {
-    pendiente: ['⏳ Esperando que el scout acepte', 'pausa'],
-    activo: ['📡 Monitoreo activo', 'ok'],
-    rechazado: ['✕ El scout rechazó el monitoreo', 'alerta'],
-    terminado: ['Sin monitoreo activo', ''],
-  };
-  const [titulo, clase] = textos[est] || ['Sin monitoreo activo', ''];
-  const caja = $('#j-mon-estado');
-  caja.textContent = titulo;
-  caja.className = `estado-grande ${clase}`;
-  let texto = 'Sin monitoreo no se guarda la ubicación del scout. El SOS funciona siempre.';
-  if (est === 'pendiente') {
-    texto = `El scout verá la solicitud al entrar a Nova o al volver a la app. Hora límite: ${m.horaLimite ? formatoHora(m.horaLimite) : 'sin definir'}`;
-  } else if (est === 'activo') {
-    texto = `Aceptado por ${textoQuien(m.aceptado.por)}. Solo tú o dev lo pueden terminar.`;
+  let texto = '📡 Pedir monitoreo';
+  if (monitoreoAbierto() && soyElMonitoreado()) {
+    if (m.estado === 'activo') texto = '📡 Monitoreo activo';
+    else if (m.origen === 'jefe') texto = '📡 Tu jefe pide monitorearte';
+    else texto = '📡 Solicitud enviada · esperando al jefe';
   }
-  $('#j-mon-texto').textContent = texto;
-  $('#j-mon-iniciar').hidden = monitoreoAbierto();
-  const fin = $('#j-mon-terminar');
-  fin.hidden = !monitoreoAbierto();
-  fin.textContent = est === 'pendiente' ? '✕ Cancelar solicitud' : '■ Terminar monitoreo';
-
-  const historial = [m, ...((await DB.leerAjuste('monitoreoHistorial')) || [])].filter(Boolean);
-  $('#j-mon-historial').innerHTML = historial.length
-    ? historial.map((h) => `<li class="evento-mon"><ul class="plain">${eventosMonitoreo(h)}</ul></li>`).join('')
-    : '<li class="muted">Todavía no hay monitoreos.</li>';
-
-  // El SOS se muestra aunque no haya monitoreo (lo activa el propio scout)
-  const sos = estado.sos && estado.sos.activo ? estado.sos : null;
-  const cajaSos = $('#j-sos');
-  cajaSos.hidden = !sos || monitoreoActivo();
-  if (sos && !monitoreoActivo()) {
-    const perfil = (await DB.leerAjuste(`perfil:${sos.rol}`)) || {};
-    cajaSos.innerHTML = `🆘 <b>SOS activo</b> de ${escapar(perfil.nombre || (ROLES[sos.rol] ? ROLES[sos.rol].nombre : 'un scout'))} desde las ${formatoHora(sos.t)}` +
-      (sos.lat !== null ? `<br>Ubicación al activarlo: ${sos.lat.toFixed(5)}, ${sos.lng.toFixed(5)}` : '<br>Sin ubicación al activarlo');
-  }
+  boton.textContent = texto;
 }
 
-/* ---------- Scout ---------- */
+/* ---------- Respuestas ---------- */
+async function aceptarMonitoreo() {
+  const m = estado.monitoreo;
+  m.estado = 'activo';
+  m.aceptado = { t: Date.now(), por: yo() };
+  if (m.origen === 'monitoreado') {
+    m.jefe = yo();
+    // El monitoreado ya aceptó compartir al pedirlo: su última ubicación pasa al jefe
+    if (m.ubicacion) {
+      await DB.guardarAjuste('ultimaUbicacion', { ...m.ubicacion, rol: m.monitoreado.rol, nombre: m.monitoreado.nombre, prueba: !!m.prueba });
+    }
+  } else {
+    m.monitoreado = yo();
+    iniciarGPS();
+    limpiarUbicacionNube(); // por si quedó algo de un monitoreo anterior
+  }
+  delete m.ubicacion;
+  await guardarMonitoreo(m);
+  await aplicarHoraLimite(m.horaLimite);
+  if (soyMonitoreado() && estado.posicion) compartirUbicacion(estado.posicion);
+  if (m.horaLimite && 'Notification' in window && Notification.permission === 'default') {
+    try { await Notification.requestPermission(); } catch { /* sin notificaciones */ }
+  }
+  pintarBotonMonitoreo();
+  refrescarJefe();
+  aviso('📡 Monitoreo activo');
+}
+
+async function rechazarMonitoreo() {
+  const m = estado.monitoreo;
+  m.estado = 'rechazado';
+  m.rechazado = { t: Date.now(), por: yo() };
+  delete m.ubicacion; // al rechazar no queda nada de su ubicación
+  await guardarMonitoreo(m);
+  await DB.guardarAjuste('ultimaUbicacion', null);
+  limpiarUbicacionNube();
+  apagarGPSSiSobra();
+  pintarBotonMonitoreo();
+  refrescarJefe();
+  aviso('Solicitud rechazada');
+}
+
+/* ¿Le toca a esta sesión responder la solicitud pendiente? */
+function meTocaResponder() {
+  const m = estado.monitoreo;
+  if (!m || m.estado !== 'pendiente' || !mismoMundo(m)) return false;
+  if (m.origen === 'jefe') return soyElMonitoreado(m);
+  return Sesion.actual() === 'jefe' || (Sesion.esDev() && Sesion.puede('jefe dev'));
+}
+
+/* Ventana para quien será monitoreado (lo pidió el jefe) */
 function pedirConsentimiento() {
   const m = estado.monitoreo;
-  if (!m || m.estado !== 'pendiente' || !esMonitoreable(Sesion.rol)) return;
+  if (!meTocaResponder() || m.origen !== 'jefe') return;
   const jefe = m.jefe && m.jefe.nombre ? m.jefe.nombre : 'Tu jefe';
   abrirModal('📡 Solicitud de monitoreo', `
-    <p><b>${escapar(jefe)}</b> quiere monitorearte durante la salida.</p>
+    <p><b>${escapar(jefe)}</b> quiere monitorearte durante la salida.${chipPrueba(m)}</p>
     <p class="small">Si aceptas, ${escapar(jefe)} verá en este teléfono:</p>
     <ul class="small">
       <li>Tu ubicación (se actualiza cada 15 segundos mientras la app está abierta).</li>
@@ -1042,33 +1282,143 @@ function pedirConsentimiento() {
     <p class="small"><b>Hasta cuándo:</b> hasta que ${escapar(jefe)} lo termine. Tú no lo puedes apagar, ni cerrando sesión.</p>
     <p class="muted small">El SOS funciona siempre, aceptes o no.</p>`,
   [
-    { texto: 'Rechazar', clase: 'secondary', accion: () => responderMonitoreo(false) },
-    { texto: 'Aceptar', clase: 'primary', accion: () => responderMonitoreo(true) },
+    { texto: 'Rechazar', clase: 'secondary', accion: rechazarMonitoreo },
+    { texto: 'Aceptar', clase: 'primary', accion: aceptarMonitoreo },
   ]);
 }
 
-async function responderMonitoreo(acepta) {
+function textoSolicitudMonitoreado(m) {
+  const u = m.ubicacion;
+  return `
+    <p><b>${escapar(textoQuien(m.monitoreado))}</b> pide que lo monitorees.${chipPrueba(m)}</p>
+    <ul class="status">
+      <li><span>Motivo</span><b>${escapar(m.motivo) || '<span class="muted">sin motivo</span>'}</b></li>
+      <li><span>Última ubicación</span><b>${u ? `${u.lat.toFixed(5)}, ${u.lng.toFixed(5)} (${formatoHace(u.t)})` : 'todavía sin señal'}</b></li>
+      <li><span>Hora límite</span><b>${m.horaLimite ? formatoHora(m.horaLimite) : 'sin definir'}</b></li>
+    </ul>
+    ${pareceperdido(m.motivo) ? '<p class="aviso-texto">⚠ Dice que puede estar perdido. Recuérdale que use el <b>SOS</b> si está en peligro: funciona siempre y avisa a su contacto de emergencia.</p>' : ''}`;
+}
+
+/* Ventana para el jefe (lo pidió el monitoreado) */
+function pedirRespuestaJefe() {
   const m = estado.monitoreo;
-  if (!m || m.estado !== 'pendiente' || !esMonitoreable(Sesion.rol)) return;
-  if (acepta) {
-    m.estado = 'activo';
-    m.aceptado = { t: Date.now(), por: yo() };
-    m.persona = Sesion.rol;
-    await guardarMonitoreo(m);
-    await aplicarHoraLimite(m.horaLimite);
-    iniciarGPS();
-    if (estado.posicion) compartirUbicacion(estado.posicion);
-    if (m.horaLimite && 'Notification' in window && Notification.permission === 'default') {
-      try { await Notification.requestPermission(); } catch { /* sin notificaciones */ }
-    }
-    aviso('📡 Monitoreo activo');
-  } else {
-    m.estado = 'rechazado';
-    m.rechazado = { t: Date.now(), por: yo() };
-    await guardarMonitoreo(m);
-    aviso('Rechazaste el monitoreo');
+  if (!meTocaResponder() || m.origen !== 'monitoreado' || Sesion.actual() !== 'jefe') return;
+  abrirModal('📡 Te piden monitoreo', textoSolicitudMonitoreado(m), [
+    { texto: 'Rechazar', clase: 'secondary', accion: rechazarMonitoreo },
+    { texto: 'Aceptar', clase: 'primary', accion: aceptarMonitoreo },
+  ]);
+}
+
+/* Al entrar o volver a la app */
+function revisarSolicitudes() {
+  pedirConsentimiento();
+  pedirRespuestaJefe();
+  const m = estado.monitoreo;
+  // Aviso (una vez) al monitoreado si el jefe rechazó su solicitud
+  if (m && m.estado === 'rechazado' && m.origen === 'monitoreado' && soyElMonitoreado(m) && !m.avisado) {
+    m.avisado = true;
+    guardarMonitoreo(m);
+    aviso('Tu jefe rechazó la solicitud de monitoreo. El SOS funciona siempre.', 5000);
   }
+  pintarBotonMonitoreo();
+}
+
+/* ---------- Terminar o cancelar ---------- */
+async function cerrarMonitoreo(como) {
+  const m = estado.monitoreo;
+  const pendiente = m.estado === 'pendiente';
+  m.estado = 'terminado';
+  m.terminado = { t: Date.now(), por: yo(), como };
+  delete m.ubicacion;
+  await guardarMonitoreo(m);
+  await aplicarHoraLimite(null);
+  await DB.guardarAjuste('ultimaUbicacion', null);
+  limpiarUbicacionNube();
+  apagarGPSSiSobra();
+  pintarBotonMonitoreo();
   refrescarJefe();
+  aviso(pendiente ? 'Solicitud cancelada' : 'Monitoreo terminado');
+}
+
+function terminarMonitoreo() {
+  const m = estado.monitoreo;
+  if (!monitoreoAbierto() || !(Sesion.puede('jefe dev') || Sesion.esDev())) return;
+  const pendiente = m.estado === 'pendiente';
+  if (Sesion.esDev()) { cerrarMonitoreo(pendiente ? 'cancelar' : 'terminar'); return; } // dev: al instante
+  abrirModal(pendiente ? 'Cancelar solicitud' : 'Terminar monitoreo', pendiente
+    ? '<p>La solicitud se cancela y ya no aparecerá.</p>'
+    : `<p>Dejarás de ver la ubicación de <b>${escapar(textoQuien(m.monitoreado))}</b>. Se borra su última ubicación guardada y la hora límite.</p>`,
+  [
+    { texto: 'No', clase: 'secondary' },
+    { texto: pendiente ? 'Cancelar solicitud' : 'Terminar', clase: 'danger', accion: () => cerrarMonitoreo(pendiente ? 'cancelar' : 'terminar') },
+  ]);
+}
+
+/* ---------- Vista del jefe ---------- */
+function eventosMonitoreo(m) {
+  const pidio = m.origen === 'monitoreado' ? 'Pedido por el monitoreado' : 'Pedido por el jefe';
+  const fin = m.terminado && m.terminado.como === 'cancelar' ? 'Cancelado' : 'Terminado';
+  return [[pidio, m.solicitado], ['Aceptado', m.aceptado], ['Rechazado', m.rechazado], [fin, m.terminado]]
+    .filter(([, e]) => e)
+    .map(([accion, e]) => `<li><b>${accion}</b>: ${escapar(textoQuien(e.por))} · ${formatoFecha(e.t)}, ${formatoHora(e.t)}</li>`)
+    .join('') + (m.motivo ? `<li class="muted">Motivo: ${escapar(m.motivo)}</li>` : '');
+}
+
+async function pintarMonitoreoJefe() {
+  const m = estado.monitoreo;
+  const est = m ? m.estado : null;
+  let titulo = 'Sin monitoreo activo';
+  let clase = '';
+  let texto = 'Sin monitoreo no se guarda la ubicación de nadie. El SOS funciona siempre.';
+  if (est === 'pendiente' && m.origen === 'jefe') {
+    titulo = '⏳ Esperando respuesta'; clase = 'pausa';
+    texto = `${ROLES[m.monitoreado.rol].nombre}: verá la solicitud al entrar a Nova o al volver a la app. Hora límite: ${m.horaLimite ? formatoHora(m.horaLimite) : 'sin definir'}`;
+  } else if (est === 'pendiente') {
+    titulo = '📨 Te piden monitoreo'; clase = pareceperdido(m.motivo) ? 'alerta' : 'pausa';
+    texto = 'Acepta o rechaza la solicitud.';
+  } else if (est === 'activo') {
+    titulo = '📡 Monitoreo activo'; clase = 'ok';
+    texto = `Monitoreado: ${textoQuien(m.monitoreado)}. Solo el jefe o dev lo pueden terminar.`;
+  } else if (est === 'rechazado') {
+    titulo = '✕ Solicitud rechazada'; clase = 'alerta';
+    texto = `Rechazada por ${textoQuien(m.rechazado.por)}. No se comparte nada.`;
+  }
+  const caja = $('#j-mon-estado');
+  caja.innerHTML = `${escapar(titulo)}${chipPrueba(m)}`;
+  caja.className = `estado-grande ${clase}`;
+  $('#j-mon-texto').textContent = texto;
+
+  const solicitud = $('#j-mon-solicitud');
+  const responder = est === 'pendiente' && m.origen === 'monitoreado';
+  solicitud.hidden = !responder;
+  if (responder) {
+    const puedo = meTocaResponder();
+    solicitud.innerHTML = textoSolicitudMonitoreado(m) + (puedo ? `
+      <div class="controls dos">
+        <button class="secondary" data-action="monitoreo-rechazar">✕ Rechazar</button>
+        <button class="primary" data-action="monitoreo-aceptar">✓ Aceptar</button>
+      </div>` : '<p class="muted small">Esta solicitud es de otra sesión (prueba o real); solo la puede responder su jefe.</p>');
+  }
+
+  $('#j-mon-iniciar').hidden = monitoreoAbierto();
+  const fin = $('#j-mon-terminar');
+  fin.hidden = !monitoreoAbierto() || responder;
+  fin.textContent = est === 'pendiente' ? '✕ Cancelar solicitud' : '■ Terminar monitoreo';
+
+  const historial = [m, ...((await DB.leerAjuste('monitoreoHistorial')) || [])].filter(Boolean);
+  $('#j-mon-historial').innerHTML = historial.length
+    ? historial.map((h) => `<li class="evento-mon">${h.prueba ? '<span class="chip prueba">PRUEBA</span>' : ''}<ul class="plain">${eventosMonitoreo(h)}</ul></li>`).join('')
+    : '<li class="muted">Todavía no hay monitoreos.</li>';
+
+  // El SOS se muestra aunque no haya monitoreo (lo activa el propio scout)
+  const sos = sosDelGrupo();
+  const cajaSos = $('#j-sos');
+  cajaSos.hidden = !sos || monitoreoActivo();
+  if (sos && !monitoreoActivo()) {
+    const perfil = (await DB.leerAjuste(Sesion.clavePerfil(sos.rol, sos.prueba))) || {};
+    cajaSos.innerHTML = `🆘 <b>SOS activo</b> de ${escapar(perfil.nombre || sos.nombre || (ROLES[sos.rol] ? ROLES[sos.rol].nombre : 'un scout'))} desde las ${formatoHora(sos.t)}${chipPrueba(sos)}` +
+      (sos.lat !== null ? `<br>Ubicación al activarlo: ${sos.lat.toFixed(5)}, ${sos.lng.toFixed(5)}` : '<br>Sin ubicación al activarlo');
+  }
 }
 
 /* ---------- Mis datos (perfil) ---------- */
@@ -1085,11 +1435,12 @@ function pintarPerfil() {
   CAMPOS_PERFIL.forEach((c) => { form.elements[c].value = estado.perfil[c] || ''; });
   $('#p-pruebas').checked = estado.pruebas;
   // El modo pruebas solo existe para el administrador
-  document.body.classList.toggle('pruebas', estado.pruebas && Sesion.rol === 'dev');
-  const info = ROLES[Sesion.rol];
+  // Herramientas de prueba: dev con el modo pruebas o en una vista de prueba
+  document.body.classList.toggle('pruebas', Sesion.esDev() && (estado.pruebas || !!Sesion.vista));
+  const info = ROLES[Sesion.actual()];
   if (info) {
     $('#pf-sesion').innerHTML = `
-      <li><span>Usuario</span><b>${info.icono} ${Sesion.rol}</b></li>
+      <li><span>Usuario</span><b>${info.icono} ${Sesion.vista ? `dev viendo como ${Sesion.vista}` : Sesion.actual()}</b></li>
       <li><span>Tipo</span><b>${info.nombre}</b></li>
       <li><span>Versión</span><b>Nova ${VERSION_APP}</b></li>`;
   }
@@ -1128,7 +1479,8 @@ async function guardarPerfil() {
   const datos = leerFormPerfil();
   if (!datos) return false;
   estado.perfil = datos;
-  await DB.guardarAjuste(`perfil:${Sesion.rol}`, estado.perfil);
+  if (Sesion.vista) estado.perfil.prueba = true;
+  await DB.guardarAjuste(Sesion.clavePerfil(), estado.perfil);
   pintarPerfil();
   refrescarJefe();
   return true;
@@ -1210,7 +1562,7 @@ function abrirSOS() {
     } },
     activo
       ? { texto: 'Desactivar SOS', clase: 'secondary', accion: async () => {
-          estado.sos = null; await DB.guardarAjuste('sos', null); refrescarJefe(); aviso('SOS desactivado');
+          estado.sos = null; await DB.guardarAjuste('sos', null); subirSosNube(); refrescarJefe(); aviso('SOS desactivado');
         } }
       : { texto: 'Cancelar', clase: 'secondary' },
   ]);
@@ -1254,8 +1606,9 @@ function enviarUbicacion() {
 
 async function activarSOS() {
   const p = estado.posicion;
-  estado.sos = { activo: true, t: Date.now(), lat: p ? p.lat : null, lng: p ? p.lng : null, rol: Sesion.rol };
+  estado.sos = { activo: true, t: Date.now(), lat: p ? p.lat : null, lng: p ? p.lng : null, rol: Sesion.actual(), prueba: Sesion.esDev() };
   await DB.guardarAjuste('sos', estado.sos);
+  subirSosNube();
   await compartirUbicacion(p);
   refrescarJefe();
 }
@@ -1297,7 +1650,7 @@ function enviarAValidacion() {
     { texto: 'Cancelar', clase: 'secondary' },
     { texto: '📤 Enviar', clase: 'primary', accion: async () => {
       ruta.estado = 'pendiente_revision';
-      ruta.envio = { t: Date.now(), por: { rol: Sesion.rol, nombre: estado.perfil.nombre || '' } };
+      ruta.envio = { t: Date.now(), por: { rol: Sesion.actual(), nombre: estado.perfil.nombre || '' } };
       delete ruta.revision;
       delete ruta.validacion;
       await DB.guardarRuta(ruta);
@@ -1315,16 +1668,32 @@ function pintarEnvio(ruta) {
   boton.textContent = ruta.estado === 'rechazada' ? '📤 Volver a enviar a validación de experto' : '📤 Enviar a validación de experto';
 }
 
+const FILTROS_RUTAS = {
+  todas: () => true,
+  reales: (r) => !r.prueba,
+  prueba: (r) => !!r.prueba,
+  revisar: (r) => r.estado === 'pendiente_revision',
+};
+
 async function refrescarLista() {
-  const rutas = await DB.todasLasRutas();
+  const panelDev = Sesion.actual() === 'dev';
+  $('#t-rutas').textContent = panelDev ? '✦ TODAS LAS RUTAS' : '✦ MIS RUTAS';
+  const filtro = estado.filtroRutas || 'todas';
+  $$('[data-filtro]').forEach((b) => b.classList.toggle('activa', b.dataset.filtro === filtro));
+  let rutas = await DB.todasLasRutas();
   const cont = $('#lista-rutas');
+  if (panelDev) {
+    rutas = rutas.filter(FILTROS_RUTAS[filtro]);
+    cont.innerHTML = rutas.length ? rutas.map((r) => itemRuta(r, true)).join('') : '<p class="muted">No hay rutas con este filtro.</p>';
+    return;
+  }
   if (!rutas.length) {
     cont.innerHTML = '<p class="muted">Aún no tienes rutas. Ve a Grabar para registrar la primera, o importa un archivo .gpx.</p>';
     return;
   }
   cont.innerHTML = rutas.map((r) => `
     <button class="ruta-item" data-ruta="${escapar(r.id)}">
-      <span><b>${escapar(r.nombre)}</b>
+      <span><b>${escapar(r.nombre)}</b>${chipPrueba(r)}
       <small class="muted">${formatoFecha(r.tiempos.inicio)} · ${formatoKm(distanciaRuta(r.coordenadas))} · ${escapar(r.tipo)}</small></span>
       ${chipEstado(r)}
     </button>`).join('');
@@ -1342,11 +1711,11 @@ async function abrirDetalle(id) {
   $('#d-nombre').textContent = ruta.nombre;
   $('#d-meta').textContent = `${formatoFecha(ruta.tiempos.inicio)} · ${formatoHora(ruta.tiempos.inicio)}` +
     (ruta.tiempos.fin ? ` a ${formatoHora(ruta.tiempos.fin)}` : '') + ` · ${ruta.tipo} · ${textoEstado(ruta.estado)}` +
-    (ruta.origen ? ` · importada (${ruta.origen})` : '');
+    (ruta.origen ? ` · importada (${ruta.origen})` : '') + (ruta.prueba ? ` · PRUEBA${ruta.generada ? ' (generada)' : ''}` : '');
 
   const dist = distanciaRuta(ruta.coordenadas);
   const enCurso = estado.grabacion && ruta.id === estado.grabacion.id;
-  const activo = enCurso ? tiempoActivo() : (ruta.tiempos.activoMs || ((ruta.tiempos.fin || Date.now()) - ruta.tiempos.inicio));
+  const activo = enCurso ? tiempoActivo() : (ruta.tiempos.activoMs || ((ruta.tiempos.fin || ahora()) - ruta.tiempos.inicio));
   const descanso = tiempoDescansos(ruta);
   const mov = Math.max(0, activo - descanso);
   const alt = datosAltitud(ruta.coordenadas);
@@ -1416,10 +1785,14 @@ const ESPERA_BORRADO = 60 * 60 * 1000; // 1 hora
 
 function eliminarRuta() {
   const ruta = estado.rutaAbierta;
+  if (!ruta) return;
   if (estado.grabacion && estado.grabacion.id === ruta.id) {
+    // dev: detiene la grabación sin guardar y la borra al instante (con "Deshacer")
+    if (Sesion.esDev()) { salirSinGuardar(() => volverDeDetalle()); return; }
     aviso('Termina la ruta en curso antes de borrarla');
     return;
   }
+  if (Sesion.esDev()) { borrarAhora(); return; } // dev: al instante, con "Deshacer"
   if (ruta.borrarEn) return;
   const cuando = Date.now() + ESPERA_BORRADO;
   abrirModal('Borrar ruta', `
@@ -1434,6 +1807,22 @@ function eliminarRuta() {
       aviso(`Se borrará a las ${formatoHora(ruta.borrarEn)}`);
     } },
   ]);
+}
+
+/* Solo dev: borra al instante y deja 5 s para deshacer */
+async function borrarAhora() {
+  const ruta = estado.rutaAbierta;
+  if (!ruta || !Sesion.esDev()) return;
+  if (estado.grabacion && estado.grabacion.id === ruta.id) { aviso('Termina la ruta en curso antes de borrarla'); return; }
+  const copia = JSON.parse(JSON.stringify(ruta));
+  await DB.borrarRuta(ruta.id);
+  volverDeDetalle();
+  await refrescarTodo();
+  avisoConAccion(`Ruta borrada: ${ruta.nombre}`, 'Deshacer', async () => {
+    await DB.guardarRuta(copia);
+    await refrescarTodo();
+    aviso('Ruta restaurada');
+  });
 }
 
 async function cancelarBorrado() {
@@ -1453,7 +1842,8 @@ function pintarBorrado(ruta) {
   caja.hidden = false;
   const min = Math.max(1, Math.ceil((ruta.borrarEn - Date.now()) / 60000));
   caja.innerHTML = `<span>🗑 Se borrará a las <b>${formatoHora(ruta.borrarEn)}</b> (en ${min} min)</span>
-    <button data-action="cancelar-borrado">Cancelar borrado</button>`;
+    <button data-action="cancelar-borrado">Cancelar borrado</button>
+    ${Sesion.esDev() ? '<button data-action="borrar-ahora">Borrar ahora</button>' : ''}`;
 }
 
 /* Borra las rutas cuyo plazo de 1 hora ya terminó */
@@ -1595,6 +1985,7 @@ function borrarTodo() {
     { texto: 'Cancelar', clase: 'secondary' },
     { texto: 'Borrar todo', clase: 'danger', accion: async () => {
       await DB.borrarTodo();
+      Nube.apagar();
       await DB.guardarAjuste('bienvenida', true);
       estado.horaLimite = null;
       estado.monitoreo = null;
@@ -1619,27 +2010,35 @@ const rolDe = (registro) => (registro && registro.rol) || 'scout'; // datos viej
  * ubicación (de las últimas 12 horas) y su SOS. */
 async function personasMonitoreo(rutas) {
   const ultima = await DB.leerAjuste('ultimaUbicacion');
-  const sos = await DB.leerAjuste('sos');
   const enCurso = rutas.find((r) => r.estado === 'en curso');
-  const ubic = ultima && Date.now() - ultima.t < HORAS_MONITOREO * 3600000 ? ultima : null;
-  const sosActivo = sos && sos.activo ? sos : null;
+  const ubic = ultima && ahora() - ultima.t < HORAS_MONITOREO * 3600000 ? ultima : null;
+  const sosActivo = sosDelGrupo();
   // Solo se muestra a quien aceptó el monitoreo
   if (!monitoreoActivo()) return [];
-  const roles = [estado.monitoreo.persona].filter((rol) => ROLES[rol]);
-  return Promise.all(roles.map(async (rol) => ({
-    rol,
-    perfil: { ...PERFIL_VACIO, ...((await DB.leerAjuste(`perfil:${rol}`)) || {}) },
-    ubic: ubic && rolDe(ubic) === rol ? ubic : null,
-    ruta: enCurso && rolDe(enCurso.autor) === rol ? enCurso : null,
-    sos: sosActivo && rolDe(sosActivo) === rol ? sosActivo : null,
-  })));
+  const m = estado.monitoreo;
+  const roles = [m.monitoreado && m.monitoreado.rol].filter((rol) => ROLES[rol]);
+  return Promise.all(roles.map(async (rol) => {
+    const ubicRol = ubic && rolDe(ubic) === rol && !!ubic.prueba === !!m.prueba ? ubic : null;
+    const local = enCurso && rolDe(enCurso.autor) === rol && !!enCurso.prueba === !!m.prueba ? enCurso : null;
+    return {
+      rol,
+      perfil: { ...PERFIL_VACIO, ...((await DB.leerAjuste(Sesion.clavePerfil(rol, m.prueba))) || {}) },
+      ubic: ubicRol,
+      // Si la persona está en otro teléfono, su ruta se arma con lo que subió a la nube
+      ruta: local || rutaRemota(rol, ubicRol),
+      sos: sosActivo && rolDe(sosActivo) === rol ? sosActivo : null,
+    };
+  }));
 }
 
 function estadoPersona(p) {
+  // Descanso y pausa son de la persona: si está en otro teléfono vienen en el resumen de la nube
+  const enDescanso = p.ruta && p.ruta.remota ? p.ruta.descanso : !!estado.descansoActual;
+  const enPausa = p.ruta && p.ruta.remota ? p.ruta.modo === 'pausada' : estado.modo === 'pausada';
   if (p.sos) return { texto: `🆘 SOS activo desde las ${formatoHora(p.sos.t)}`, corto: '🆘 SOS', clase: 'alerta' };
-  if (p.ruta && estado.horaLimite && Date.now() > estado.horaLimite) return { texto: '⚠ Retrasado', corto: '⚠ retrasado', clase: 'alerta' };
-  if (p.ruta && estado.descansoActual) return { texto: '⏸ En descanso', corto: 'descanso', clase: 'pausa' };
-  if (p.ruta && estado.modo === 'pausada') return { texto: '⏸ Ruta en pausa', corto: 'en pausa', clase: 'pausa' };
+  if (p.ruta && estado.horaLimite && ahora() > estado.horaLimite) return { texto: '⚠ Retrasado', corto: '⚠ retrasado', clase: 'alerta' };
+  if (p.ruta && enDescanso) return { texto: '⏸ En descanso', corto: 'descanso', clase: 'pausa' };
+  if (p.ruta && enPausa) return { texto: '⏸ Ruta en pausa', corto: 'en pausa', clase: 'pausa' };
   if (p.ruta) return { texto: '🥾 En ruta', corto: 'en ruta', clase: 'ok' };
   return { texto: 'Sin ruta activa', corto: 'sin ruta', clase: '' };
 }
@@ -1656,7 +2055,7 @@ function itemPersona(p) {
   ].filter(Boolean).join(' · ');
   return `
     <button class="ruta-item" data-persona="${p.rol}">
-      <span><b>${ROLES[p.rol].icono} ${escapar(nombrePersona(p))}</b>
+      <span><b>${ROLES[p.rol].icono} ${escapar(nombrePersona(p))}</b>${chipPrueba(estado.monitoreo)}
       <small class="muted">${escapar(detalle)}</small></span>
       <span class="chip ${e.clase}">${escapar(e.corto)}</span>
     </button>`;
@@ -1700,7 +2099,7 @@ async function refrescarJefe() {
       ? `${formatoKm(distanciaRuta(p.ruta.coordenadas))} · desde las ${formatoHora(p.ruta.tiempos.inicio)}`
       : 'ninguna';
     $('#j-limite').textContent = estado.horaLimite
-      ? `${formatoHora(estado.horaLimite)}${Date.now() > estado.horaLimite ? ' · ya pasó' : ''}`
+      ? `${formatoHora(estado.horaLimite)}${ahora() > estado.horaLimite ? ' · ya pasó' : ''}`
       : 'sin definir';
     $('#j-salud').innerHTML = lineasSaludPersona(p.perfil);
   }
@@ -1736,7 +2135,7 @@ const textoAutor = (r) => (r.autor
 function itemRuta(r, conAutor = false) {
   return `
     <button class="ruta-item" data-ruta="${escapar(r.id)}">
-      <span><b>${escapar(r.nombre)}</b>
+      <span><b>${escapar(r.nombre)}</b>${chipPrueba(r)}
       <small class="muted">${formatoFecha(r.tiempos.inicio)} · ${formatoKm(distanciaRuta(r.coordenadas))}` +
       `${conAutor ? ` · ${escapar(textoAutor(r))}` : ` · ${escapar(r.tipo)}`}</small></span>
       ${chipEstado(r)}
@@ -1793,8 +2192,11 @@ function pintarRevision(ruta) {
     html += rev ? '<button class="link" data-action="quitar-revision">Quitar revisión</button>' : '';
   } else if (Sesion.puede('exp dev')) {
     const puedeAprobar = ruta.validacion && ruta.validacion.dentro && !(rev && rev.estado === 'validada');
-    html += `<div class="controls">
-      <button class="${puedeAprobar ? 'secondary' : 'primary'}" data-action="validar">🥾 Realizar recorrido de validación</button>
+    const generar = Sesion.esDev() && ['exp', 'dev'].includes(Sesion.actual());
+    const caminar = Sesion.actual() !== 'dev'; // la vista de dev no tiene Grabar
+    html += `<div class="controls${generar && caminar ? ' dos' : ''}">
+      ${caminar ? `<button class="${puedeAprobar ? 'secondary' : 'primary'}" data-action="validar">🥾 Realizar recorrido de validación</button>` : ''}
+      ${generar ? '<button class="secondary" data-action="generar-recorrido">🛠 Generar recorrido</button>' : ''}
     </div>
     <div class="controls dos">
       <button class="primary" data-action="aprobar"${puedeAprobar ? '' : ' disabled'}>✓ Aprobar</button>
@@ -1822,7 +2224,7 @@ function revisarRuta(resultado) {
       ruta.revision = {
         estado: resultado,
         nota,
-        por: estado.perfil.nombre ? `${estado.perfil.nombre} (${ROLES[Sesion.rol].nombre})` : ROLES[Sesion.rol].nombre,
+        por: estado.perfil.nombre ? `${estado.perfil.nombre} (${ROLES[Sesion.actual()].nombre})` : ROLES[Sesion.actual()].nombre,
         t: Date.now(),
       };
       await DB.guardarRuta(ruta);
@@ -1856,7 +2258,7 @@ const TOLERANCIA_VALIDACION = 15; // %
 const tieneAltitud = (coords) => coords.some((c) => c[3] !== null && c[3] !== undefined);
 const formatoPorcentaje = (n) => `${n.toFixed(1)} %`;
 const quienFirma = () => (estado.perfil.nombre
-  ? `${estado.perfil.nombre} (${ROLES[Sesion.rol].nombre})` : ROLES[Sesion.rol].nombre);
+  ? `${estado.perfil.nombre} (${ROLES[Sesion.actual()].nombre})` : ROLES[Sesion.actual()].nombre);
 
 /* Diferencia relativa respecto al valor original, en % */
 function variacionPorcentaje(original, real) {
@@ -1883,7 +2285,7 @@ function compararRecorridos(original, recorrido) {
   return {
     recorridoId: recorrido.id,
     t: Date.now(),
-    por: { rol: Sesion.rol, nombre: estado.perfil.nombre || '' },
+    por: { rol: Sesion.actual(), nombre: estado.perfil.nombre || '' },
     tolerancia: TOLERANCIA_VALIDACION,
     distancia,
     desnivel,
@@ -2020,7 +2422,7 @@ async function aprobarRuta(ruta, datos) {
     estado: 'validada',
     nota: datos.obs,
     vigencia: { inicio: datos.inicio, fin: datos.fin },
-    experto: { rol: Sesion.rol, nombre: estado.perfil.nombre || '' },
+    experto: { rol: Sesion.actual(), nombre: estado.perfil.nombre || '' },
     por: quienFirma(),
     t: Date.now(),
     recorridoId: v.recorridoId,
@@ -2037,10 +2439,318 @@ async function aprobarRuta(ruta, datos) {
 }
 
 /* =========================================================
+ * 11b-3. Recorrido de validación generado (solo dev)
+ * =========================================================
+ * Crea un recorrido "falso" a partir de la ruta original para probar la
+ * comparación sin caminar: por variación (zigzag o atajos) o por puntos
+ * tocados en el mapa. Se guarda con prueba: true y generada: true.
+ */
+const PASO_GENERADO = 10;   // m entre puntos
+const RUIDO_GENERADO = 2;   // ± m en "por puntos"
+const VELOCIDAD_GENERADA = 1.2; // m/s en "por puntos"
+
+/* Proyección local en metros (suficiente para unos kilómetros) */
+function proyeccion(coords) {
+  const lat0 = coords[0][0];
+  const lng0 = coords[0][1];
+  const kx = 111320 * Math.cos((lat0 * Math.PI) / 180);
+  const ky = 110540;
+  return {
+    aXY: (c) => ({ x: (c[1] - lng0) * kx, y: (c[0] - lat0) * ky }),
+    aLatLng: (p) => [lat0 + p.y / ky, lng0 + p.x / kx],
+  };
+}
+
+const distXY = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const largoXY = (pts) => pts.reduce((s, p, i) => (i ? s + distXY(pts[i - 1], p) : 0), 0);
+
+/* Agrega puntos para que ningún tramo mida más de "paso" metros */
+function densificar(pts, paso = PASO_GENERADO) {
+  const salida = [pts[0]];
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1];
+    const b = pts[i];
+    const n = Math.max(1, Math.ceil(distXY(a, b) / paso));
+    for (let k = 1; k <= n; k++) salida.push({ x: a.x + ((b.x - a.x) * k) / n, y: a.y + ((b.y - a.y) * k) / n });
+  }
+  return salida;
+}
+
+/* Zigzag lateral suave (onda de 60 m) con amplitud A; los extremos no se mueven */
+function zigzag(pts, A) {
+  const L = largoXY(pts);
+  let s = 0;
+  return pts.map((p, i) => {
+    if (i > 0) s += distXY(pts[i - 1], p);
+    if (i === 0 || i === pts.length - 1) return { ...p };
+    const a = pts[i - 1];
+    const b = pts[i + 1];
+    const d = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    const nx = -(b.y - a.y) / d;
+    const ny = (b.x - a.x) / d;
+    const suave = Math.min(1, s / 30, (L - s) / 30); // entra y sale sin brincos
+    const desp = A * suave * Math.sin((2 * Math.PI * s) / 60);
+    return { x: p.x + nx * desp, y: p.y + ny * desp };
+  });
+}
+
+/* Atajos: simplificación de Douglas-Peucker con tolerancia eps (m) */
+function simplificar(pts, eps) {
+  if (pts.length < 3) return pts.slice();
+  const marcados = new Array(pts.length).fill(false);
+  marcados[0] = marcados[pts.length - 1] = true;
+  const pila = [[0, pts.length - 1]];
+  while (pila.length) {
+    const [i, j] = pila.pop();
+    const a = pts[i];
+    const b = pts[j];
+    const d = distXY(a, b) || 1;
+    let max = -1;
+    let k = -1;
+    for (let m = i + 1; m < j; m++) {
+      const dist = Math.abs((b.x - a.x) * (a.y - pts[m].y) - (a.x - pts[m].x) * (b.y - a.y)) / d;
+      if (dist > max) { max = dist; k = m; }
+    }
+    if (k !== -1 && max > eps) { marcados[k] = true; pila.push([i, k], [k, j]); }
+  }
+  return pts.filter((_, i) => marcados[i]);
+}
+
+/* Busca por bisección el parámetro que deja el largo a ±0.5 % de la meta (o mejor).
+ * crecer: true si el largo aumenta con el parámetro. */
+function biseccion(funcion, meta, minimo, maximo, crecer) {
+  let lo = minimo;
+  let hi = maximo;
+  let mejor = funcion(maximo);
+  for (let i = 0; i < 60; i++) {
+    const medio = (lo + hi) / 2;
+    const r = funcion(medio);
+    if (Math.abs(r.largo - meta) < Math.abs(mejor.largo - meta)) mejor = r;
+    if (Math.abs(r.largo - meta) / meta <= 0.001) return r; // más fino que el ±0.5 % pedido
+    if ((r.largo < meta) === crecer) lo = medio; else hi = medio;
+  }
+  return mejor;
+}
+
+/* Altitud de la ruta original a la misma fracción del recorrido */
+function perfilAltitud(original) {
+  const coords = original.coordenadas;
+  if (!tieneAltitud(coords)) return () => null;
+  const acum = [0];
+  for (let i = 1; i < coords.length; i++) acum.push(acum[i - 1] + distanciaMetros(coords[i - 1], coords[i]));
+  const total = acum[acum.length - 1] || 1;
+  const alts = coords.map((c) => c[3]);
+  return (fraccion) => {
+    const s = fraccion * total;
+    let i = acum.findIndex((v) => v >= s);
+    if (i <= 0) i = 1;
+    const a0 = alts[i - 1] ?? alts[i];
+    const a1 = alts[i] ?? a0;
+    if (a0 === null || a0 === undefined) return null;
+    const tramo = acum[i] - acum[i - 1] || 1;
+    return a0 + ((a1 - a0) * (s - acum[i - 1])) / tramo;
+  };
+}
+
+/* Convierte puntos XY en coordenadas [lat, lng, t, alt] repartiendo la duración */
+function armarCoordenadas(pts, proy, duracionMs, altitudEn) {
+  const L = largoXY(pts) || 1;
+  const inicio = Date.now() - duracionMs;
+  let s = 0;
+  return pts.map((p, i) => {
+    if (i > 0) s += distXY(pts[i - 1], p);
+    const [lat, lng] = proy.aLatLng(p);
+    const alt = altitudEn(s / L, p);
+    return [lat, lng, Math.round(inicio + (duracionMs * s) / L), alt === null ? null : Math.round(alt * 10) / 10];
+  });
+}
+
+function duracionOriginal(original) {
+  const c = original.coordenadas;
+  const fin = original.tiempos.fin || c[c.length - 1][2];
+  const d = fin - original.tiempos.inicio;
+  return d > 0 ? d : (distanciaRuta(c) / VELOCIDAD_GENERADA) * 1000;
+}
+
+/* a) Por variación de distancia (%) y de desnivel (%) */
+function generarPorVariacion(original, varDist, varDesnivel) {
+  const proy = proyeccion(original.coordenadas);
+  const base = densificar(original.coordenadas.map(proy.aXY));
+  const L0 = largoXY(base);
+  const meta = L0 * (1 + varDist / 100);
+  let geometria = { pts: base, largo: L0 };
+  if (varDist > 0) {
+    let maxA = 5;
+    while (largoXY(zigzag(base, maxA)) < meta && maxA < 2000) maxA *= 2;
+    geometria = biseccion((A) => { const pts = zigzag(base, A); return { pts, largo: largoXY(pts) }; }, meta, 0, maxA, true);
+  } else if (varDist < 0) {
+    const diag = Math.hypot(...['x', 'y'].map((k) => Math.max(...base.map((p) => p[k])) - Math.min(...base.map((p) => p[k])))) || 1;
+    geometria = biseccion((eps) => { const pts = simplificar(base, eps); return { pts, largo: largoXY(pts) }; }, meta, 0, diag, false);
+  }
+  const pts = densificar(geometria.pts);
+  const perfil = perfilAltitud(original);
+  const alt0 = perfil(0);
+  const factor = 1 + varDesnivel / 100;
+  const coords = armarCoordenadas(pts, proy, duracionOriginal(original), (f) => {
+    const a = perfil(f);
+    return a === null ? null : alt0 + (a - alt0) * factor;
+  });
+  const logrado = ((largoXY(pts) - L0) / L0) * 100;
+  return { coords, nota: Math.abs(logrado - varDist) > 0.6
+    ? `No se pudo llegar a ${varDist > 0 ? '+' : ''}${varDist} %: el trazo quedó en ${logrado.toFixed(1)} %.` : '' };
+}
+
+/* b) Por puntos tocados en el mapa: [[lat, lng], ...] */
+function generarPorPuntos(original, toques) {
+  const proy = proyeccion(original.coordenadas);
+  const pts = densificar(toques.map((t) => proy.aXY(t))).map((p, i, todos) => (i === 0 || i === todos.length - 1 ? p
+    : { x: p.x + (Math.random() * 2 - 1) * RUIDO_GENERADO, y: p.y + (Math.random() * 2 - 1) * RUIDO_GENERADO }));
+  const origXY = original.coordenadas.map((c) => ({ ...proy.aXY(c), alt: c[3] }));
+  const conAlt = origXY.filter((p) => p.alt !== null && p.alt !== undefined);
+  // Altitud: promedio de los 2 puntos más cercanos de la original, pesado por distancia
+  const altitud = (_, p) => {
+    if (!conAlt.length) return null;
+    const cerca = conAlt.map((o) => ({ d: distXY(o, p), alt: o.alt })).sort((a, b) => a.d - b.d).slice(0, 2);
+    const pesos = cerca.map((c) => 1 / Math.max(c.d, 0.5));
+    return cerca.reduce((s, c, i) => s + c.alt * pesos[i], 0) / pesos.reduce((s, w) => s + w, 0);
+  };
+  const duracion = (largoXY(pts) / VELOCIDAD_GENERADA) * 1000;
+  return { coords: armarCoordenadas(pts, proy, duracion, altitud), nota: '' };
+}
+
+/* Ventana de "Generar recorrido" */
+function abrirGenerador() {
+  const original = estado.rutaAbierta;
+  if (!Sesion.esDev() || !original || original.estado !== 'pendiente_revision') return;
+  if (original.coordenadas.length < 2) { aviso('La ruta no tiene puntos'); return; }
+  const conAlt = tieneAltitud(original.coordenadas);
+  abrirModal('🛠 Generar recorrido', `
+    <div class="gen-pestanas">
+      <button type="button" class="activa" data-gen="variacion">Por variación</button>
+      <button type="button" data-gen="puntos">Por puntos</button>
+    </div>
+    <div id="gen-mapa"></div>
+    <div id="gen-variacion">
+      <label class="gen-control">Distancia <b id="gen-d-v">+8 %</b> <span id="gen-d-e" class="chip ok">dentro</span>
+        <input type="range" id="gen-d" min="-50" max="50" step="1" value="8"></label>
+      <label class="gen-control">Desnivel <b id="gen-s-v">0 %</b> <span id="gen-s-e" class="chip ok">dentro</span>
+        <input type="range" id="gen-s" min="-50" max="50" step="1" value="0"${conAlt ? '' : ' disabled'}></label>
+      ${conAlt ? '' : '<p class="muted small">La ruta original no tiene altitud: el desnivel no se compara.</p>'}
+    </div>
+    <div id="gen-puntos" hidden>
+      <p class="muted small">Toca el mapa para agregar puntos en orden. Toca un punto para quitarlo.</p>
+      <div class="controls dos">
+        <button type="button" class="secondary" id="gen-deshacer">↶ Deshacer</button>
+        <button type="button" class="secondary" id="gen-limpiar">Quitar todos</button>
+      </div>
+    </div>
+    <button type="button" class="primary" id="gen-generar">Generar vista previa</button>
+    <div id="gen-resultado"></div>`,
+  [
+    { texto: 'Cancelar', clase: 'secondary' },
+    { texto: 'Usar como validación', clase: 'primary', accion: () => usarGenerado(original) },
+  ]);
+  const usar = $('#m-botones button:last-child');
+  usar.disabled = true;
+
+  const mapa = crearMapa('gen-mapa');
+  const capa = L.layerGroup().addTo(mapa);
+  const origLinea = L.polyline(original.coordenadas.map((c) => [c[0], c[1]]),
+    { color: '#89dceb', weight: 3, opacity: 0.8, dashArray: '6 8' }).addTo(mapa);
+  setTimeout(() => { mapa.invalidateSize(); mapa.fitBounds(origLinea.getBounds(), { padding: [20, 20] }); }, 60);
+  $('#modal').addEventListener('close', () => mapa.remove(), { once: true });
+
+  let pestana = 'variacion';
+  const toques = [];
+  estado.generado = null;
+
+  const pintarToques = () => {
+    capa.clearLayers();
+    if (estado.generado) L.polyline(estado.generado.coords.map((c) => [c[0], c[1]]), { color: '#ffd700', weight: 4 }).addTo(capa);
+    if (pestana !== 'puntos') return;
+    if (toques.length > 1) L.polyline(toques, { color: '#fab387', weight: 2, dashArray: '2 6' }).addTo(capa);
+    toques.forEach((t, i) => {
+      L.marker(t, { icon: L.divIcon({ className: 'gen-punto', html: String(i + 1), iconSize: [22, 22] }) })
+        .on('click', () => { toques.splice(i, 1); invalidar(); })
+        .addTo(capa);
+    });
+  };
+  const invalidar = () => { estado.generado = null; usar.disabled = true; $('#gen-resultado').innerHTML = ''; pintarToques(); };
+
+  const etiqueta = (id) => {
+    const v = Number($(`#gen-${id}`).value);
+    $(`#gen-${id}-v`).textContent = `${v > 0 ? '+' : ''}${v} %`;
+    const chip = $(`#gen-${id}-e`);
+    const fuera = Math.abs(v) > TOLERANCIA_VALIDACION;
+    chip.textContent = id === 's' && !conAlt ? 'no se compara' : fuera ? 'fuera' : 'dentro';
+    chip.className = `chip ${id === 's' && !conAlt ? '' : fuera ? 'alerta' : 'ok'}`;
+  };
+  ['d', 's'].forEach((id) => {
+    etiqueta(id);
+    $(`#gen-${id}`).addEventListener('input', () => { etiqueta(id); invalidar(); });
+  });
+
+  $$('[data-gen]').forEach((b) => b.addEventListener('click', () => {
+    pestana = b.dataset.gen;
+    $$('[data-gen]').forEach((x) => x.classList.toggle('activa', x === b));
+    $('#gen-variacion').hidden = pestana !== 'variacion';
+    $('#gen-puntos').hidden = pestana !== 'puntos';
+    invalidar();
+  }));
+  mapa.on('click', (e) => {
+    if (pestana !== 'puntos') return;
+    toques.push([e.latlng.lat, e.latlng.lng]);
+    invalidar();
+  });
+  $('#gen-deshacer').addEventListener('click', () => { toques.pop(); invalidar(); });
+  $('#gen-limpiar').addEventListener('click', () => { toques.length = 0; invalidar(); });
+
+  $('#gen-generar').addEventListener('click', () => {
+    if (pestana === 'puntos' && toques.length < 2) { aviso('Toca al menos 2 puntos en el mapa'); return; }
+    const r = pestana === 'puntos'
+      ? generarPorPuntos(original, toques)
+      : generarPorVariacion(original, Number($('#gen-d').value), Number($('#gen-s').value));
+    estado.generado = r;
+    const comparacion = compararRecorridos(original, { id: 'vista-previa', coordenadas: r.coords });
+    $('#gen-resultado').innerHTML = tablaComparacion(comparacion) +
+      (r.nota ? `<p class="aviso-texto small">${escapar(r.nota)}</p>` : '') +
+      (comparacion.dentro ? '<p class="aviso-bien small">Quedará dentro de la tolerancia.</p>'
+        : `<p class="aviso-texto small">Quedará fuera (más de ${TOLERANCIA_VALIDACION} %).</p>`);
+    usar.disabled = false;
+    pintarToques();
+  });
+}
+
+async function usarGenerado(original) {
+  const r = estado.generado;
+  estado.generado = null;
+  if (!r) return;
+  const c = r.coords;
+  const ahora = Date.now();
+  const recorrido = {
+    id: `ruta-${ahora}`,
+    nombre: `Validación generada: ${original.nombre}`,
+    tipo: original.tipo,
+    coordenadas: c,
+    tiempos: { inicio: c[0][2], fin: c[c.length - 1][2], paradas: [], activoMs: c[c.length - 1][2] - c[0][2] },
+    estado: 'validacion',
+    autor: yo(),
+    validacionDe: original.id,
+    prueba: true,
+    generada: true,
+  };
+  await DB.guardarRuta(recorrido);
+  await terminarValidacion(recorrido);
+}
+
+/* =========================================================
  * 11c. Administrador (dev)
  * ========================================================= */
 async function refrescarAdmin() {
   if (!Sesion.puede('dev')) return;
+  pintarNubeAdmin(true);
+  $('#a-red').textContent = esOffline() ? '📴 Offline' : '🌐 Online';
+  $('#btn-red').textContent = esOffline() ? 'Cambiar a online' : 'Cambiar a offline';
   const filas = await Promise.all(Object.entries(ROLES).map(async ([rol, info]) => {
     const pred = await Sesion.usaPredeterminada(rol);
     return `
@@ -2051,6 +2761,15 @@ async function refrescarAdmin() {
       </div>`;
   }));
   $('#a-claves').innerHTML = filas.join('');
+
+  const enCurso = $('#a-en-curso');
+  const g = estado.grabacion;
+  enCurso.hidden = !g;
+  if (g) {
+    const rol = g.autor && ROLES[g.autor.rol] ? g.autor.rol : 'scout';
+    enCurso.innerHTML = `⏺ Hay una ruta en curso en la vista <b>${ROLES[rol].nombre}</b>${g.prueba ? ' (prueba)' : ''} · ` +
+      `<button class="secondary chico" data-action="ver-como" data-rol="${rol}">Ir</button>`;
+  }
 
   const rutas = await DB.todasLasRutas();
   let uso = '—';
@@ -2063,6 +2782,58 @@ async function refrescarAdmin() {
     <li><span>Pendientes de revisión</span><b>${rutas.filter((r) => r.estado === 'pendiente_revision').length}</b></li>
     <li><span>Espacio usado</span><b>${uso}</b></li>
     <li><span>Abierta como</span><b>${ABIERTA_COMO_ARCHIVO ? 'archivo' : location.host}</b></li>`;
+}
+
+/* ---------- Vistas de prueba (solo dev) ---------- */
+function perfilDePrueba(rol) {
+  return {
+    ...PERFIL_VACIO,
+    nombre: `${ROLES[rol].nombre} de prueba`, nacimiento: '2010-05-20', sangre: 'O+',
+    alergias: 'Ninguna (prueba)', medico: 'Ninguno (prueba)',
+    emergNombre: 'Contacto de prueba', emergTel: '5500000000', jefe: 'Jefe de prueba', jefeTel: '5500000001',
+    prueba: true,
+  };
+}
+
+async function verComo(rol) {
+  if (!Sesion.esDev()) return;
+  // Como al cerrar sesión: la ruta abierta queda en pausa y el simulador se detiene
+  if (estado.modo === 'grabando') pausarRuta();
+  detenerSimulador();
+  await Sesion.guardarVista(rol);
+  if (Sesion.vista && !(await DB.leerAjuste(Sesion.clavePerfil()))) {
+    await DB.guardarAjuste(Sesion.clavePerfil(), perfilDePrueba(rol));
+  }
+  apagarGPSSiSobra();
+  aviso(Sesion.vista ? `🛠 Viendo como ${ROLES[rol].nombre}` : 'De vuelta como dev'); // antes, para no tapar otros avisos
+  await entrarComo(Sesion.actual(), true);
+  if (!Sesion.vista) irATab('admin');
+}
+
+async function borrarDatosPrueba() {
+  if (!Sesion.esDev()) return;
+  if (estado.grabacion && estado.grabacion.prueba) { aviso('Termina la ruta de prueba en curso primero'); return; }
+  const rutas = (await DB.todasLasRutas()).filter((r) => r.prueba);
+  for (const r of rutas) await DB.borrarRuta(r.id);
+  for (const rol of Object.keys(ROLES)) await DB.borrarAjuste(`perfil:prueba-${rol}`);
+  let monitoreos = 0;
+  if (estado.monitoreo && estado.monitoreo.prueba) {
+    if (monitoreoActivo()) await aplicarHoraLimite(null);
+    estado.monitoreo = null;
+    await DB.borrarAjuste('monitoreo');
+    monitoreos++;
+  }
+  const historial = (await DB.leerAjuste('monitoreoHistorial')) || [];
+  const reales = historial.filter((h) => !h.prueba);
+  monitoreos += historial.length - reales.length;
+  await DB.guardarAjuste('monitoreoHistorial', reales);
+  const ultima = await DB.leerAjuste('ultimaUbicacion');
+  if (ultima && ultima.prueba) await DB.borrarAjuste('ultimaUbicacion');
+  if (estado.sos && estado.sos.prueba) { estado.sos = null; await DB.borrarAjuste('sos'); }
+  apagarGPSSiSobra();
+  pintarHud();
+  await refrescarTodo();
+  aviso(`Datos de prueba borrados: ${rutas.length} rutas, ${monitoreos} monitoreos y los perfiles de prueba`, 4000);
 }
 
 async function cambiarClave(rol) {
@@ -2090,72 +2861,38 @@ function restablecerClaves() {
  * 11d. Inicio y cierre de sesión
  * ========================================================= */
 let resolverLogin = null;
-const login = { rol: null, pin: '' };
 
 function pasoLogin(nombre) {
-  ['roles', 'pin', 'registro'].forEach((p) => { $(`#paso-${p}`).hidden = p !== nombre; });
+  ['login', 'registro'].forEach((p) => { $(`#paso-${p}`).hidden = p !== nombre; });
 }
 
-function pintarRoles() {
-  $('#l-roles').innerHTML = Object.entries(ROLES).map(([rol, info]) => `
-    <button type="button" class="rol-tarjeta" data-login-rol="${rol}" style="--c:${info.color}">
-      <span class="cara">
-        <span class="icono">${info.icono}</span>
-        <span class="nombre">${info.nombre.toUpperCase()}</span>
-        <span class="desc">${info.desc}</span>
-      </span>
-      <span class="pie"><span>usuario: ${rol}</span><b>▶ ENTRAR</b></span>
-    </button>`).join('');
-}
-
-function pintarPin() {
-  const n = Math.max(4, login.pin.length);
-  $('#l-puntos').innerHTML = Array.from({ length: n }, (_, i) => `<i class="${i < login.pin.length ? 'lleno' : ''}"></i>`).join('');
-}
-
-function elegirRol(rol) {
-  login.rol = rol;
-  login.pin = '';
-  const info = ROLES[rol];
-  document.body.style.setProperty('--acento', info.color);
-  $('#l-rol').innerHTML = `<span class="icono">${info.icono}</span> ${info.nombre.toUpperCase()}`;
-  $('#l-error').hidden = true;
-  pintarPin();
-  pasoLogin('pin');
-}
-
-function teclaPin(t) {
-  if (t === 'borrar') login.pin = login.pin.slice(0, -1);
-  else if (t === 'ok') { probarPin(); return; }
-  else if (login.pin.length < 12) login.pin += t;
-  $('#l-error').hidden = true;
-  pintarPin();
-}
-
-async function probarPin() {
-  if (!login.pin) return;
-  const rol = await Sesion.comprobar(login.rol, login.pin);
+async function probarLogin() {
+  const rol = await Sesion.comprobar($('#l-usuario').value, $('#l-clave').value);
+  $('#l-clave').value = '';
   if (!rol) {
-    login.pin = '';
-    pintarPin();
     $('#l-error').hidden = false;
-    const caja = $('#paso-pin');
+    const caja = $('#paso-login');
     caja.classList.remove('sacudir');
     void caja.offsetWidth;
     caja.classList.add('sacudir');
     if (navigator.vibrate) navigator.vibrate(120);
+    $('#l-clave').focus();
     return;
   }
-  document.body.style.removeProperty('--acento');
+  $('#l-error').hidden = true;
+  $('#l-usuario').value = '';
   await Sesion.guardar(rol);
-  await cargarPerfil(rol);
-  if (!(await DB.leerAjuste(`perfil:${rol}`))) {
+  await cargarPerfil();
+  if (!(await DB.leerAjuste(Sesion.clavePerfil()))) {
     empezarRegistro(rol);
     return;
   }
   await entrarComo(rol);
   terminarLogin(rol);
 }
+
+$('#f-login').addEventListener('submit', (e) => { e.preventDefault(); probarLogin(); }); // Enter también entra
+$('#f-login').addEventListener('input', () => { $('#l-error').hidden = true; });
 
 function terminarLogin(rol) {
   if (resolverLogin) { resolverLogin(rol); resolverLogin = null; }
@@ -2173,48 +2910,38 @@ function empezarRegistro(rol) {
   $('#login').scrollTop = 0;
 }
 
+async function cambiarDeUsuario() {
+  document.body.classList.remove('registrando');
+  $('#perfil-destino').appendChild($('#form-perfil'));
+  $('#pf-guardar').textContent = 'Guardar perfil';
+  await Sesion.cerrar();
+  estado.perfil = Object.assign({}, PERFIL_VACIO);
+  aplicarPermisos();
+  pasoLogin('login');
+  $('#l-error').hidden = true;
+  setTimeout(() => $('#l-usuario').focus(), 50);
+}
+
 async function terminarRegistro() {
   document.body.classList.remove('registrando');
   $('#perfil-destino').appendChild($('#form-perfil'));
   $('#pf-guardar').textContent = 'Guardar perfil';
-  await entrarComo(Sesion.rol);
-  terminarLogin(Sesion.rol);
+  await entrarComo(Sesion.actual());
+  terminarLogin(Sesion.actual());
 }
 
 function mostrarLogin() {
   aplicarPermisos();
-  pintarRoles();
-  pasoLogin('roles');
+  pasoLogin('login');
+  $('#l-error').hidden = true;
+  setTimeout(() => $('#l-usuario').focus(), 50);
   $('#l-pie').textContent = `Nova ${VERSION_APP} · by Ariel`;
   return new Promise((resolve) => { resolverLogin = resolve; });
 }
 
-$('#l-teclado').innerHTML = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'borrar', '0', 'ok']
-  .map((t) => `<button type="button" data-tecla="${t}" class="${t === 'ok' ? 'ok' : ''}">${t === 'borrar' ? '⌫' : t === 'ok' ? '✓' : t}</button>`).join('');
-
-$('#login').addEventListener('click', (e) => {
-  const tarjeta = e.target.closest('[data-login-rol]');
-  if (tarjeta) return elegirRol(tarjeta.dataset.loginRol);
-  const tecla = e.target.closest('[data-tecla]');
-  if (tecla) return teclaPin(tecla.dataset.tecla);
-  if (e.target.closest('[data-login="volver"]')) {
-    document.body.style.removeProperty('--acento');
-    pasoLogin('roles');
-  }
-});
-
-// Teclado físico en la computadora
-document.addEventListener('keydown', (e) => {
-  if (!document.body.classList.contains('sin-sesion') || $('#paso-pin').hidden) return;
-  if (/^[0-9]$/.test(e.key)) teclaPin(e.key);
-  else if (e.key === 'Backspace') teclaPin('borrar');
-  else if (e.key === 'Enter') teclaPin('ok');
-  else if (e.key === 'Escape') pasoLogin('roles');
-});
-
-async function cargarPerfil(rol) {
-  // Cada tipo de usuario tiene sus propios datos
-  const guardado = (await DB.leerAjuste(`perfil:${rol}`)) || {};
+async function cargarPerfil() {
+  // Cada tipo de usuario tiene sus propios datos (las vistas de prueba, los suyos)
+  const guardado = (await DB.leerAjuste(Sesion.clavePerfil())) || {};
   // Perfiles de versiones anteriores: "telefono" era el del jefe
   if (guardado.telefono && !guardado.jefeTel) guardado.jefeTel = guardado.telefono;
   estado.perfil = Object.assign({}, PERFIL_VACIO, guardado);
@@ -2222,27 +2949,29 @@ async function cargarPerfil(rol) {
 }
 
 async function entrarComo(rol, silencioso = false) {
-  await cargarPerfil(rol);
+  await cargarPerfil();
+  await aplicarNube(); // lo último que haya en la nube (monitoreo, SOS)
   aplicarPermisos();
-  pintarPerfil();
+  moverFormPerfil();
   refrescarTodo();
   irATab(ROLES[rol].inicio);
   // El GPS no se enciende al entrar: solo con monitoreo aceptado, ruta, SOS o "Enviar mi ubicación"
   if (soyMonitoreado()) iniciarGPS();
   pintarHud();
-  pedirConsentimiento();
+  revisarSolicitudes();
   if (!silencioso) aviso(`Hola, ${estado.perfil.nombre.split(' ')[0] || ROLES[rol].nombre} ✦`);
 }
 
 function menuCuenta() {
-  const info = ROLES[Sesion.rol];
+  const info = ROLES[Sesion.actual()];
   const grabando = estado.modo !== 'detenida';
   abrirModal(`${info.icono} ${info.nombre}`, `
-    <p class="small">Usuario: <b>${Sesion.rol}</b>${estado.perfil.nombre ? ` · ${escapar(estado.perfil.nombre)}` : ''}</p>
+    <p class="small">Usuario: <b>${Sesion.actual()}</b>${estado.perfil.nombre ? ` · ${escapar(estado.perfil.nombre)}` : ''}</p>
     ${grabando ? '<p class="small aviso-texto">Tienes una ruta abierta. Quedará en pausa y se recupera al volver a entrar.</p>' : ''}
     ${soyMonitoreado() ? '<p class="small aviso-texto">📡 El monitoreo sigue activo aunque cierres sesión. Solo tu jefe lo puede terminar.</p>' : ''}`,
   [
     { texto: 'Cerrar', clase: 'secondary' },
+    ...(Sesion.vista ? [{ texto: 'Volver a dev', clase: 'secondary', accion: () => verComo('dev') }] : []),
     { texto: 'Cerrar sesión', clase: 'danger', accion: cerrarSesion },
   ]);
 }
@@ -2281,83 +3010,281 @@ async function leerBateria() {
 }
 
 async function refrescarTodo() {
-  if (!Sesion.rol) return;
+  if (!Sesion.actual()) return;
   await Promise.all([refrescarInicio(), refrescarLista(), refrescarJefe(), refrescarRevisar(), refrescarAdmin()]);
 }
 
 /* =========================================================
- * 13. Simulador y modo demostración (sin GPS real)
- * ========================================================= */
-function arrancarSimulador(siguientePunto, intervalo, mensaje) {
+ * 13. Simulador y modo demostración (reloj virtual)
+ * =========================================================
+ * ahora() es Date.now() normalmente. Durante una simulación avanza más
+ * rápido: inicioSim + (Date.now() - inicioReal) * velocidad. Todo lo que
+ * mide la ruta usa ahora(). Al terminar la simulación el reloj sigue a 1x
+ * desde donde quedó (para que el tiempo nunca regrese) y vuelve a ser
+ * Date.now() al guardar o descartar la ruta.
+ */
+const reloj = { activo: false, velocidad: 1, inicioSim: 0, inicioReal: 0 };
+const PASO_SIM_MS = 5000;   // un punto cada 5 s de tiempo simulado
+const VELOCIDAD_SIM = 1.2;  // m/s
+const sim = { puntos: [], i: 0, fin: 0, ocupado: false };
+
+function ahora() {
+  return reloj.activo ? Math.round(reloj.inicioSim + (Date.now() - reloj.inicioReal) * reloj.velocidad) : Date.now();
+}
+
+function ajustarReloj(velocidad) {
+  const t = ahora();
+  reloj.inicioSim = t;
+  reloj.inicioReal = Date.now();
+  reloj.velocidad = velocidad;
+  reloj.activo = true;
+  pintarSim();
+}
+
+function apagarReloj() {
+  reloj.activo = false;
+  reloj.velocidad = 1;
+  pintarSim();
+}
+
+const textoDuracion = (ms) => {
+  const min = Math.round(ms / 60000);
+  const h = Math.floor(min / 60);
+  return h ? `${h} h${min % 60 ? ` ${min % 60} min` : ''}` : `${min} min`;
+};
+const textoReal = (ms) => {
+  if (ms < 60000) return `${Math.max(1, Math.round(ms / 1000))} s reales`;
+  const min = ms / 60000;
+  return `${Number.isInteger(min) ? min : min.toFixed(1)} min reales`;
+};
+
+/* Indicador "SIM 10x" y control de velocidad en Grabar */
+function pintarSim() {
+  const activo = !!estado.simulador;
+  $('#h-sim').hidden = !activo;
+  if (activo) hud('sim', `SIM ${reloj.velocidad}x`, 'medio');
+  $('#sim-control').hidden = !activo;
+  if (activo) {
+    $('#sim-vel').value = reloj.velocidad;
+    $('#sim-vel-t').textContent = `${reloj.velocidad}x`;
+  }
+  $('#btn-simular').textContent = activo ? '⏹ Detener simulación' : '▶ Simular recorrido de prueba';
+}
+
+/* Ventana para elegir duración y velocidad.
+ * modo 'libre': recorrido inventado; 'repetir': la ruta abierta (o la original de la validación) */
+function abrirSimulacion(modo, previo = null) {
+  if (estado.simulador) { detenerSimulador(); aviso('Simulación detenida'); return; }
+  estado.eligiendoInicio = null; // si se estaba eligiendo el inicio, se cancela
+  if (Sesion.actual() === 'dev') { aviso('Usa "Ver como" para simular: la vista de dev no graba rutas'); return; }
+  const validando = estado.grabacion && estado.grabacion.validacionDe;
+  if (estado.modo !== 'detenida' && !validando) { aviso('Termina la ruta en curso antes de simular'); return; }
+  if (modo === 'repetir' && estado.modo !== 'detenida') { aviso('Termina la ruta en curso antes de la demostración'); return; }
+  const original = modo === 'repetir' ? estado.rutaAbierta : null;
+  if (modo === 'repetir' && (!original || original.coordenadas.length < 2)) { aviso('La ruta no tiene puntos'); return; }
+  const p = previo || { h: 1, m: 30, v: 10 };
+  const libre = !original && !validando; // solo el recorrido inventado tiene punto de inicio elegible
+  const descripcion = original ? `Repetirá <b>${escapar(original.nombre)}</b> repartida en la duración elegida.`
+    : validando ? 'Repetirá la <b>ruta original</b> de la validación.'
+      : `Recorrido inventado a ${VELOCIDAD_SIM} m/s con 1 o 2 descansos de 3 a 8 minutos.`;
+  abrirModal('▶ Simular recorrido', `
+    <p class="small">${descripcion}</p>
+    ${libre ? `<div style="display:flex;gap:8px;margin:8px 0">
+      <button type="button" class="secondary" id="f-sim-inicio" style="flex:1">${textoInicioSim()}</button>
+      ${estado.simInicio ? '<button type="button" class="secondary chico" id="f-sim-quitar">Quitar</button>' : ''}
+    </div>` : ''}
+    <div class="fila-dos">
+      <label>Horas<input type="number" id="f-sim-h" min="0" max="12" value="${p.h}"></label>
+      <label>Minutos<input type="number" id="f-sim-m" min="0" max="59" value="${p.m}"></label>
+    </div>
+    <label class="gen-control">Velocidad <b id="f-sim-v-t">${p.v}x</b>
+      <input type="range" id="f-sim-v" min="1" max="50" step="1" value="${p.v}"></label>
+    <p class="aviso-bien small" id="f-sim-resumen"></p>`,
+  [
+    { texto: 'Cancelar', clase: 'secondary' },
+    { texto: '▶ Simular', clase: 'primary', accion: async () => {
+      const datos = leerSimulacion();
+      if (datos.duracion <= 0) { aviso('La duración debe ser mayor a 0'); abrirSimulacion(modo, datos); return; }
+      let base = original;
+      if (!base && validando) base = await DB.leerRuta(estado.grabacion.validacionDe);
+      empezarSimulacion(base, datos.duracion, datos.v);
+    } },
+  ]);
+  const resumen = () => {
+    const d = leerSimulacion();
+    $('#f-sim-v-t').textContent = `${d.v}x`;
+    $('#f-sim-resumen').textContent = d.duracion > 0
+      ? `${textoDuracion(d.duracion)} a ${d.v}x = ${textoReal(d.duracion / d.v)}` : 'Elige una duración mayor a 0';
+  };
+  ['#f-sim-h', '#f-sim-m', '#f-sim-v'].forEach((s) => $(s).addEventListener('input', resumen));
+  resumen();
+  if (libre) {
+    $('#f-sim-inicio').addEventListener('click', () => {
+      const datos = leerSimulacion();
+      $('#modal').close();
+      pedirInicioSim(modo, datos);
+    });
+    const quitar = $('#f-sim-quitar');
+    if (quitar) quitar.addEventListener('click', () => { const datos = leerSimulacion(); quitarInicioSim(); abrirSimulacion(modo, datos); });
+  }
+}
+
+/* ---------- Punto de inicio del recorrido inventado ---------- */
+function textoInicioSim() {
+  return estado.simInicio
+    ? `📍 Inicio: ${estado.simInicio[0].toFixed(4)}, ${estado.simInicio[1].toFixed(4)} (cambiar)`
+    : '📍 Elegir inicio en el mapa';
+}
+
+function pedirInicioSim(modo, datos) {
+  estado.eligiendoInicio = { modo, datos };
+  irATab('grabar');
+  mapaGrabar();
+  bloquearMapa(false); // mapa libre para moverlo y tocar
+  aviso('Mueve el mapa y toca donde quieres empezar. Para cancelar, toca "Simular" otra vez', 6000);
+}
+
+function fijarInicioSim(punto) {
+  estado.simInicio = punto;
+  if (!mapas.inicioSim) mapas.inicioSim = L.marker(punto);
+  else mapas.inicioSim.setLatLng(punto);
+  mapas.inicioSim.addTo(mapaGrabar());
+}
+
+function quitarInicioSim() {
+  estado.simInicio = null;
+  if (mapas.inicioSim) { mapas.inicioSim.remove(); mapas.inicioSim = null; }
+}
+
+function leerSimulacion() {
+  const limitar = (v, max) => Math.min(max, Math.max(0, Math.round(Number(v) || 0)));
+  const h = limitar($('#f-sim-h').value, 12);
+  const m = limitar($('#f-sim-m').value, 59);
+  const v = Math.max(1, limitar($('#f-sim-v').value, 50));
+  return { h, m, v, duracion: (h * 60 + m) * 60000 };
+}
+
+/* Puntos del recorrido inventado: 1.2 m/s, un punto cada 5 s y 1 o 2 descansos */
+function planLibre(t0, duracion) {
+  const descansos = [];
+  const cuantos = duracion >= 30 * 60000 && Math.random() < 0.5 ? 2 : 1;
+  const zonas = cuantos === 1 ? [[0.4, 0.6]] : [[0.2, 0.35], [0.6, 0.75]];
+  zonas.forEach(([a, b]) => {
+    const largo = Math.min((3 + Math.random() * 5) * 60000, duracion * 0.3);
+    const inicio = t0 + duracion * (a + Math.random() * (b - a));
+    descansos.push([inicio, inicio + largo]);
+  });
+  const enDescanso = (t) => descansos.some(([a, b]) => t >= a && t < b);
+  // Si se eligió un inicio en el mapa se usa; si no, el punto de siempre
+  const inicio = estado.simInicio || [CENTRO_INICIAL[0] - 0.004, CENTRO_INICIAL[1] - 0.01];
+  let lat = inicio[0];
+  let lng = inicio[1];
+  let alt = 2350;
+  let rumbo = Math.random() * Math.PI * 2;
+  const paso = VELOCIDAD_SIM * (PASO_SIM_MS / 1000);
+  const puntos = [];
+  for (let t = t0; t <= t0 + duracion; t += PASO_SIM_MS) {
+    if (!enDescanso(t) && t > t0) {
+      rumbo += (Math.random() - 0.5) * 0.35;
+      lat += (Math.cos(rumbo) * paso) / 110540;
+      lng += (Math.sin(rumbo) * paso) / (111320 * Math.cos((lat * Math.PI) / 180));
+      alt += Math.random() * 0.6 - 0.1;
+    }
+    puntos.push({ t, lat, lng, alt });
+  }
+  return puntos;
+}
+
+/* Reparte los puntos de una ruta a lo largo de la duración, según la distancia */
+function planRepetir(ruta, t0, duracion) {
+  const c = ruta.coordenadas;
+  const acum = [0];
+  for (let i = 1; i < c.length; i++) acum.push(acum[i - 1] + distanciaMetros(c[i - 1], c[i]));
+  const total = acum[acum.length - 1] || 1;
+  return c.map((p, i) => ({ t: t0 + Math.round((duracion * acum[i]) / total), lat: p[0], lng: p[1], alt: p[3] }));
+}
+
+function empezarSimulacion(original, duracion, velocidad) {
   if (idWatch !== null) { navigator.geolocation.clearWatch(idWatch); idWatch = null; }
-  estado.simulador = setInterval(() => {
-    const p = siguientePunto();
-    if (!p) { detenerSimulador(); aviso('Fin de la demostración; pulsa Terminar para guardar', 4000); return; }
-    recibirPosicion(p[0], p[1], 6, Date.now(), p[2]);
-  }, intervalo);
-  $('#btn-simular').textContent = '⏹ Detener simulación';
+  reloj.inicioSim = Date.now();
+  reloj.inicioReal = Date.now();
+  reloj.velocidad = velocidad;
+  reloj.activo = true;
+  sim.puntos = [];
+  sim.i = 0;
+  // Primero se marca la simulación: así iniciarRuta() no enciende el GPS real
+  estado.simulador = setInterval(pasoSimulacion, 100);
   irATab('grabar');
   bloquearMapa(true);
-  if (estado.modo === 'detenida') setTimeout(iniciarRuta, 1200);
-  aviso(mensaje);
+  let t0 = ahora();
+  if (estado.modo !== 'grabando') { // nueva ruta, o reanuda la validación
+    iniciarRuta();
+    t0 = estado.inicioTramo; // el mismo instante en que empezó a contar: la duración queda exacta
+  }
+  sim.puntos = original ? planRepetir(original, t0, duracion) : planLibre(t0, duracion);
+  sim.fin = t0 + duracion;
+  pintarSim();
+  aviso(`Simulando ${textoDuracion(duracion)} a ${velocidad}x (${textoReal(duracion / velocidad)})`, 4000);
 }
 
-function iniciarSimulador() {
-  if (estado.simulador) { detenerSimulador(); aviso('Simulación detenida'); return; }
-  if (estado.modo !== 'detenida') { aviso('Termina la ruta en curso antes de simular'); return; }
-  let lat = CENTRO_INICIAL[0] - 0.004;
-  let lng = CENTRO_INICIAL[1] - 0.01;
-  let alt = 2350;
-  let paso = 0;
-  let rumbo = 0.6;
-  arrancarSimulador(() => {
-    paso++;
-    // Del paso 70 al 140 se queda quieto: genera un descanso automático
-    if (paso < 70 || paso > 140) {
-      rumbo += (Math.random() - 0.5) * 0.4;
-      lat += Math.cos(rumbo) * 0.000025;
-      lng += Math.sin(rumbo) * 0.000025;
-      alt += Math.random() * 0.9;
+async function pasoSimulacion() {
+  if (sim.ocupado || !estado.simulador) return;
+  sim.ocupado = true;
+  try {
+    const t = Math.min(ahora(), sim.fin);
+    while (sim.i < sim.puntos.length && sim.puntos[sim.i].t <= t) {
+      const p = sim.puntos[sim.i++];
+      await recibirPosicion(p.lat, p.lng, 5, p.t, p.alt);
     }
-    return [lat + (Math.random() - 0.5) * 0.000004, lng, alt];
-  }, 1000, 'Simulando recorrido (≈2.8 m/s)');
+    if (ahora() >= sim.fin) terminarSimulacion();
+  } finally {
+    sim.ocupado = false;
+  }
 }
 
-function repetirRuta() {
-  const ruta = estado.rutaAbierta;
-  if (estado.modo !== 'detenida' || estado.simulador) { aviso('Termina la ruta en curso antes de la demostración'); return; }
-  if (ruta.coordenadas.length < 2) { aviso('La ruta no tiene puntos'); return; }
-  // Se reproduce en unos 90 segundos, sin importar lo larga que sea
-  const salto = Math.max(1, Math.ceil(ruta.coordenadas.length / 180));
-  let i = 0;
-  arrancarSimulador(() => {
-    if (i >= ruta.coordenadas.length) return null;
-    const c = ruta.coordenadas[i];
-    i += salto;
-    return [c[0], c[1], c[3]];
-  }, 500, `Demostración: ${ruta.nombre}`);
+/* Al cumplir la duración: se detiene sola y la ruta queda en pausa con el tiempo exacto */
+function terminarSimulacion() {
+  clearInterval(estado.simulador);
+  estado.simulador = null;
+  reloj.inicioSim = sim.fin;
+  reloj.inicioReal = Date.now();
+  reloj.velocidad = 1;
+  if (estado.modo === 'grabando') pausarRuta();
+  pintarSim();
+  if (estado.modo !== 'detenida' || soyMonitoreado()) iniciarGPS();
+  aviso('Fin de la simulación; pulsa Terminar para guardar', 5000);
 }
 
+/* Detener a mano (o al cambiar de vista): el reloj sigue a 1x desde donde iba */
 function detenerSimulador() {
   if (!estado.simulador) return;
   clearInterval(estado.simulador);
   estado.simulador = null;
-  $('#btn-simular').textContent = '▶ Simular recorrido de prueba';
+  if (reloj.activo) ajustarReloj(1);
+  pintarSim();
   // Vuelve al GPS real solo si hace falta (ruta abierta o monitoreo aceptado)
   if (estado.modo !== 'detenida' || soyMonitoreado()) iniciarGPS();
 }
 
+$('#sim-vel').addEventListener('input', (e) => {
+  if (!estado.simulador) return;
+  ajustarReloj(Number(e.target.value));
+});
+
 /* =========================================================
  * 14. Ventana emergente genérica
  * ========================================================= */
-function abrirModal(titulo, html, botones) {
+function abrirModal(titulo, html, botones, { cerrable = true } = {}) {
   const modal = $('#modal');
   if (modal.open) modal.close();
+  modal.dataset.cerrable = cerrable ? 'si' : 'no';
+  $('#m-cerrar').hidden = !cerrable;
   $('#m-titulo').textContent = titulo;
   $('#m-cuerpo').innerHTML = html;
   const cont = $('#m-botones');
   cont.innerHTML = '';
   cont.classList.toggle('uno', botones.length === 1);
+  cont.classList.toggle('tres', botones.length >= 3);
   botones.forEach((b) => {
     const btn = document.createElement('button');
     btn.textContent = b.texto;
@@ -2374,12 +3301,62 @@ function abrirModal(titulo, html, botones) {
   modal.showModal();
 }
 
+// ✕, Esc y tocar fuera cierran sin hacer nada (excepto en ventanas sin ✕, como "Guardando mapa…")
+$('#m-cerrar').addEventListener('click', () => $('#modal').close());
+$('#modal').addEventListener('cancel', (e) => { if ($('#modal').dataset.cerrable === 'no') e.preventDefault(); });
+$('#modal').addEventListener('click', (e) => {
+  const modal = $('#modal');
+  if (e.target !== modal || modal.dataset.cerrable === 'no') return;
+  const r = modal.getBoundingClientRect();
+  if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) modal.close();
+});
+
+/* ---------- Botón atrás del celular ----------
+ * Cierra la ventana → sale del detalle → regresa a la pestaña de inicio.
+ * Solo en el inicio sin nada abierto deja salir de la app (grabando, pregunta). */
+const prepararAtras = () => history.pushState({ nova: true }, '');
+
+window.addEventListener('popstate', () => {
+  const body = document.body;
+  if (body.classList.contains('registrando')) { prepararAtras(); cambiarDeUsuario(); return; }
+  if (body.classList.contains('sin-sesion')) { history.back(); return; }
+  const modal = $('#modal');
+  if (modal.open) {
+    if (modal.dataset.cerrable !== 'no') modal.close();
+    prepararAtras();
+    return;
+  }
+  if ($('#tab-rutas').classList.contains('active') && !$('#detalle-ruta').hidden) { volverDeDetalle(); prepararAtras(); return; }
+  if (document.querySelector('.tab.active').id !== `tab-${tabInicio()}`) { irATab(tabInicio()); prepararAtras(); return; }
+  if (estado.grabacion) {
+    prepararAtras();
+    abrirModal('Hay una ruta en curso', '<p>Si sales ahora, la ruta sigue abierta en pausa. Puedes seguir o salir sin guardarla.</p>', [
+      { texto: 'Seguir', clase: 'primary' },
+      { texto: 'Salir sin guardar', clase: 'danger', accion: () => salirSinGuardar() },
+    ]);
+    return;
+  }
+  history.back(); // en el inicio y sin nada abierto: sale de la app
+});
+
 /* =========================================================
  * 15. Navegación y eventos
  * ========================================================= */
+/* El formulario de perfil vive en Perfil (salvo durante el registro) */
+function moverFormPerfil() {
+  if (document.body.classList.contains('registrando')) return;
+  $('#perfil-destino').appendChild($('#form-perfil'));
+  $('#pf-guardar').textContent = 'Guardar perfil';
+  pintarPerfil();
+}
+
+const tabInicio = () => (ROLES[Sesion.actual()] ? ROLES[Sesion.actual()].inicio : 'grabar');
+
 function irATab(nombre) {
   const boton = document.querySelector(`.tabbar [data-tab="${nombre}"]`);
-  if (!boton || boton.classList.contains('sin-permiso')) nombre = 'grabar';
+  if (!boton || boton.classList.contains('sin-permiso')) nombre = tabInicio();
+  // La barra de estado (#hud) solo se ve en Grabar
+  document.body.classList.toggle('tab-grabar', nombre === 'grabar');
   $$('.tab').forEach((t) => t.classList.toggle('active', t.id === `tab-${nombre}`));
   $$('.tabbar button').forEach((b) => b.classList.toggle('active', b.dataset.tab === nombre));
   $('main').scrollTop = 0;
@@ -2388,7 +3365,7 @@ function irATab(nombre) {
   if (nombre === 'rutas') { cerrarDetalle(); refrescarLista(); }
   if (nombre === 'revisar') refrescarRevisar();
   if (nombre === 'admin') refrescarAdmin();
-  if (nombre === 'perfil') pintarPerfil();
+  if (nombre === 'perfil') moverFormPerfil();
 }
 
 const acciones = {
@@ -2398,11 +3375,26 @@ const acciones = {
   'terminar': terminarRuta,
   'centrar': centrarMapa,
   'guardar-zona': guardarZona,
+  'alternar-red': alternarModoRed,
+  'nube-alternar': alternarNube,
+  'nube-generar': generarCodigoNube,
+  'nube-probar': probarNube,
+  'nube-limpiar': limpiarNube,
   'jefe-limite': definirHoraLimite,
   'monitoreo-iniciar': iniciarMonitoreo,
+  'monitoreo-aceptar': () => { if (meTocaResponder()) aceptarMonitoreo(); },
+  'monitoreo-rechazar': () => { if (meTocaResponder()) rechazarMonitoreo(); },
+  'pedir-monitoreo': pedirMonitoreo,
+  'generar-recorrido': abrirGenerador,
+  'borrar-ahora': borrarAhora,
+  'volver-dev': () => verComo('dev'),
+  'borrar-prueba': borrarDatosPrueba,
+  'descartar': () => salirSinGuardar(),
+  'cancelar-validacion': cancelarValidacion,
+  'cambiar-usuario': cambiarDeUsuario,
   'monitoreo-terminar': terminarMonitoreo,
   'sos': abrirSOS,
-  'simular': iniciarSimulador,
+  'simular': () => abrirSimulacion('libre'),
   'volver-lista': volverDeDetalle,
   'cuenta': menuCuenta,
   'aprobar': () => formularioAprobacion(),
@@ -2418,7 +3410,7 @@ const acciones = {
   'ver-ruta': verRutaCompleta,
   'hud': detalleEstado,
   'cerrar-sesion': () => cerrarSesion(),
-  'repetir': repetirRuta,
+  'repetir': () => abrirSimulacion('repetir'),
   'importar': () => $('#f-importar').click(),
   'borrar-todo': borrarTodo,
   'instalar': () => instalarApp(),
@@ -2433,6 +3425,9 @@ document.addEventListener('click', (e) => {
   if (e.target.closest('#hud')) return detalleEstado();
   const accion = e.target.closest('[data-action]');
   if (accion && accion.dataset.action === 'cambiar-clave') return cambiarClave(accion.dataset.rol);
+  if (accion && accion.dataset.action === 'ver-como') return verComo(accion.dataset.rol);
+  const filtro = e.target.closest('[data-filtro]');
+  if (filtro) { estado.filtroRutas = filtro.dataset.filtro; return refrescarLista(); }
   if (accion && acciones[accion.dataset.action]) return acciones[accion.dataset.action]();
   const persona = e.target.closest('[data-persona]');
   if (persona) {
@@ -2501,11 +3496,271 @@ async function ofrecerInstalacion() {
 }
 
 /* =========================================================
+ * 15b. Nube (Firebase): monitoreo entre teléfonos
+ * =========================================================
+ * Ajuste 'nube': { url, codigo, activa }. Solo dev lo configura (Admin → Nube) y vale
+ * para todos los usuarios de este teléfono. Qué se sincroniza (ver nube.js):
+ *   monitoreo  lo escribe quien lo cambia y lo reciben todos (el mismo objeto del ajuste 'monitoreo')
+ *   ubicacion  solo la sube quien aceptó el monitoreo, y solo si en la nube el monitoreo está activo
+ *   rastro     puntos de su ruta abierta, para dibujarla en el teléfono del jefe
+ *   sos        lo sube quien lo activa (el SOS funciona siempre)
+ * El perfil de salud (sangre, alergias…) NO se sube. Las sesiones de dev (vistas de prueba)
+ * no suben ni reciben nada: lo de prueba se queda en el teléfono. En modo offline la nube se
+ * pausa y lo pendiente se sube al volver a online.
+ */
+const nubeLista = () => Nube.activa() && !Sesion.esDev();
+
+function subirMonitoreoNube(m) {
+  if (!m || m.prueba || !nubeLista()) return;
+  Nube.subir('monitoreo', m);
+}
+
+/* Resumen de la ruta abierta de este teléfono, para que el jefe vea su estado */
+function resumenRutaNube() {
+  if (!estado.grabacion || estado.modo === 'detenida') return null;
+  return { modo: estado.modo, descanso: !!estado.descansoActual, inicio: estado.grabacion.tiempos.inicio };
+}
+
+function subirUbicacionNube(registro) {
+  if (!registro || registro.prueba || !nubeLista()) return;
+  // Solo se sube si en la nube el monitoreo está activo: un consentimiento viejo guardado
+  // en este teléfono no basta
+  const m = Nube.datos().monitoreo;
+  const activoEnNube = (m && m.estado === 'activo') || Nube.hayPendiente('monitoreo');
+  if (!activoEnNube) return;
+  const ruta = resumenRutaNube();
+  const previa = Nube.datos().ubicacion;
+  const rutaNueva = Nube.sincronizada() && !!ruta && (!previa || !previa.ruta || previa.ruta.inicio !== ruta.inicio);
+  Nube.subir('ubicacion', { ...registro, ruta });
+  if (!ruta) return;
+  const punto = [Number(registro.lat.toFixed(6)), Number(registro.lng.toFixed(6))];
+  if (rutaNueva) Nube.subir('rastro', { [registro.t]: punto }); // ruta nueva: se empieza el rastro de cero
+  else Nube.subir(`rastro/${registro.t}`, punto);
+}
+
+function limpiarUbicacionNube() {
+  if (!nubeLista()) return;
+  Nube.subir('ubicacion', null);
+  Nube.subir('rastro', null);
+}
+
+function subirSosNube() {
+  const s = estado.sos;
+  if (!nubeLista() || (s && s.prueba)) return;
+  Nube.subir('sos', s && s.activo
+    ? { activo: true, t: s.t, lat: s.lat, lng: s.lng, rol: s.rol, nombre: estado.perfil.nombre || '' } : null);
+}
+
+/* El SOS que se muestra al jefe: el de otro teléfono (nube) o el de este mismo teléfono */
+function sosDelGrupo() {
+  if (estado.sosRemoto && estado.sosRemoto.activo) return estado.sosRemoto;
+  return estado.sos && estado.sos.activo ? estado.sos : null;
+}
+
+/* Ruta de la persona monitoreada cuando está en otro teléfono, armada con lo de la nube */
+function rutaRemota(rol, ubic) {
+  if (!Nube.activa() || Sesion.esDev() || soyElMonitoreado() || !ubic || !ubic.ruta) return null;
+  const rastro = Nube.datos().rastro || {};
+  const coordenadas = Object.keys(rastro).map(Number).sort((x, y) => x - y)
+    .map((t) => [rastro[t][0], rastro[t][1], t]);
+  return {
+    remota: true, modo: ubic.ruta.modo, descanso: !!ubic.ruta.descanso,
+    coordenadas, tiempos: { inicio: ubic.ruta.inicio }, autor: { rol }, prueba: false,
+  };
+}
+
+/* Lo que llega de la nube se copia al teléfono, sin volver a subirlo */
+async function adoptarMonitoreo(nuevo) {
+  const anterior = estado.monitoreo;
+  estado.monitoreo = nuevo;
+  await DB.guardarAjuste('monitoreo', nuevo);
+  const limite = nuevo.estado === 'activo' ? (nuevo.horaLimite || null) : null;
+  if (limite !== (estado.horaLimite || null)) await aplicarHoraLimite(limite);
+  if (anterior && anterior.estado === 'activo' && nuevo.estado !== 'activo') {
+    // Terminó o cambió en otro teléfono: se borra lo guardado y se apaga el GPS si ya no hace falta
+    await DB.guardarAjuste('ultimaUbicacion', null);
+    apagarGPSSiSobra();
+    if (soyElMonitoreado(nuevo) && nuevo.estado === 'terminado') aviso('El monitoreo terminó', 4000);
+  }
+  if (soyMonitoreado()) {
+    iniciarGPS();
+    if (estado.posicion) compartirUbicacion(estado.posicion);
+  }
+  pintarHud();
+  pintarBotonMonitoreo();
+  if (Sesion.rol) { revisarSolicitudesSinInterrumpir(); refrescarJefe(); }
+}
+
+/* La solicitud no debe cerrar una ventana abierta (el SOS, por ejemplo): espera a que se cierre */
+function revisarSolicitudesSinInterrumpir(intento = 0) {
+  if ($('#modal').open) {
+    if (intento < 24) setTimeout(() => revisarSolicitudesSinInterrumpir(intento + 1), 5000);
+    return;
+  }
+  revisarSolicitudes();
+}
+
+function avisarSosRemoto(s) {
+  if (Sesion.actual() !== 'jefe') return;
+  const quien = s.nombre || (ROLES[s.rol] ? ROLES[s.rol].nombre : 'Alguien');
+  alertar('🆘 SOS', `${quien} activó el SOS.`);
+  abrirModal('🆘 SOS activo', `
+    <p><b>${escapar(quien)}</b> activó el SOS a las ${formatoHora(s.t)}.</p>
+    <p class="small">${s.lat !== null ? `Ubicación al activarlo: ${s.lat.toFixed(5)}, ${s.lng.toFixed(5)}` : 'Sin ubicación al activarlo.'}</p>`,
+  [
+    { texto: 'Cerrar', clase: 'secondary' },
+    { texto: 'Ver en Jefe', clase: 'danger', accion: () => irATab('jefe') },
+  ]);
+}
+
+let aplicandoNube = false;
+let repetirNube = false;
+
+async function aplicarNube() {
+  if (aplicandoNube) { repetirNube = true; return; }
+  aplicandoNube = true;
+  try {
+    do {
+      repetirNube = false;
+      await aplicarNubeUnaVez();
+    } while (repetirNube);
+  } catch (err) {
+    console.warn('Nube:', err);
+  } finally {
+    aplicandoNube = false;
+  }
+}
+
+async function aplicarNubeUnaVez() {
+  if (!Nube.activa() || Sesion.esDev() || !Nube.sincronizada()) return;
+  const d = Nube.datos();
+
+  // 1. Monitoreo: si la nube tiene uno distinto, se adopta (salvo que este teléfono tenga un cambio por enviar)
+  if (d.monitoreo && !Nube.hayPendiente('monitoreo')) {
+    const remoto = normalizarMonitoreo({
+      jefe: null, monitoreado: null, motivo: '', horaLimite: null, aceptado: null, rechazado: null, terminado: null,
+      ...d.monitoreo,
+    });
+    if (!nubeIgual(remoto, estado.monitoreo)) await adoptarMonitoreo(remoto);
+  }
+
+  // 2. Ubicación: la copia el teléfono de quien monitorea (la vista del jefe la lee de aquí)
+  if (monitoreoActivo() && !soyElMonitoreado() && d.ubicacion) {
+    const local = await DB.leerAjuste('ultimaUbicacion');
+    if (!nubeIgual(d.ubicacion, local)) await DB.guardarAjuste('ultimaUbicacion', d.ubicacion);
+  }
+
+  // 3. SOS de otro teléfono
+  const sos = d.sos && d.sos.activo ? { ...d.sos, lat: d.sos.lat ?? null, lng: d.sos.lng ?? null, prueba: false } : null;
+  if (!nubeIgual(sos, estado.sosRemoto)) {
+    const nuevo = !!sos && (!estado.sosRemoto || estado.sosRemoto.t !== sos.t);
+    estado.sosRemoto = sos;
+    if (nuevo) avisarSosRemoto(sos);
+  }
+
+  pintarHud();
+  if (Sesion.rol && $('#tab-jefe').classList.contains('active')) refrescarJefe();
+}
+
+/* ---------- Arranque y pantalla de Admin ---------- */
+async function iniciarNube() {
+  const guardado = (await DB.leerAjuste('nube')) || {};
+  Nube.permitidoSi(() => !esOffline());
+  Nube.alCambiar(() => aplicarNube());
+  Nube.alEstado(() => { pintarHud(); pintarNubeAdmin(); });
+  Nube.configurar({ url: guardado.url, codigo: guardado.codigo, activa: !!guardado.activa });
+}
+
+const TEXTOS_NUBE = {
+  apagada: '⚪ Apagada', pausada: '⏸ En pausa', conectando: '🔄 Conectando…',
+  conectada: '🟢 Conectada', 'sin-red': '🔴 Sin conexión (reintentando)',
+};
+
+function textoEstadoNube() {
+  const c = Nube.config();
+  const e = Nube.estado();
+  if (!c.activa) return '⚪ Apagada';
+  if (esOffline()) return '⏸ En pausa (modo offline)';
+  if (e.conexion === 'error') return `⚠ ${e.detalle}`;
+  const pendientes = Nube.cuantosPendientes();
+  return `${TEXTOS_NUBE[e.conexion] || e.conexion}${pendientes ? ` · ${pendientes} por enviar` : ''}`;
+}
+
+function pintarNubeAdmin(llenar = false) {
+  const lugar = $('#n-estado');
+  if (!lugar) return;
+  const c = Nube.config();
+  lugar.textContent = textoEstadoNube();
+  $('#btn-nube').textContent = c.activa ? 'Apagar la nube' : 'Activar la nube';
+  // Los campos solo se rellenan si la persona no los está editando
+  if (llenar && document.activeElement !== $('#n-codigo') && document.activeElement !== $('#n-url')) {
+    $('#n-codigo').value = c.codigo;
+    $('#n-url').value = c.url;
+  }
+}
+
+const leerFormNube = () => ({
+  url: $('#n-url').value.trim() || NUBE_URL_PREDETERMINADA,
+  codigo: $('#n-codigo').value.trim(),
+});
+
+async function alternarNube() {
+  if (!Sesion.esDev()) return;
+  const f = leerFormNube();
+  if (Nube.config().activa) {
+    await DB.guardarAjuste('nube', { ...f, activa: false });
+    Nube.configurar({ ...f, activa: false });
+    aviso('Nube apagada');
+  } else {
+    if (!NUBE_CODIGO_VALIDO.test(f.codigo)) { aviso('El código necesita de 16 a 64 letras o números', 4000); return; }
+    await DB.guardarAjuste('nube', { ...f, activa: true });
+    Nube.configurar({ ...f, activa: true });
+    aviso('Conectando con la nube…');
+  }
+  pintarNubeAdmin();
+  pintarHud();
+}
+
+function generarCodigoNube() {
+  const letras = 'abcdefghijkmnpqrstuvwxyz23456789'; // sin letras que se confunden (l, o, 0, 1)
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  $('#n-codigo').value = Array.from(bytes, (b) => letras[b % letras.length]).join('');
+  aviso('Código nuevo. Usa el mismo en todos los teléfonos', 4000);
+}
+
+async function probarNube() {
+  if (!Sesion.esDev()) return;
+  if (esOffline()) { aviso('Modo offline: cámbialo a online para probar la nube', 4000); return; }
+  const f = leerFormNube();
+  aviso('Probando la conexión…', 3000);
+  let pasos;
+  try { pasos = await Nube.probar(f.url, f.codigo); }
+  catch (err) { pasos = [{ nombre: 'Prueba', ok: false, texto: nubeTextoError(err) }]; }
+  const todo = pasos.every((p) => p.ok);
+  abrirModal(todo ? '✓ La nube está lista' : '⚠ La nube no está lista', `
+    ${pasos.map((p) => `<p class="small"><b>${p.ok ? '✓' : '✗'} ${escapar(p.nombre)}:</b> ${escapar(p.texto)}</p>`).join('')}
+    ${todo ? '<p class="muted small">La base responde y las reglas permiten leer y escribir con este código.</p>' : ''}`,
+  [{ texto: 'Entendido', clase: 'primary' }]);
+}
+
+function limpiarNube() {
+  if (!Sesion.esDev()) return;
+  if (esOffline()) { aviso('Modo offline: cámbialo a online para usar la nube', 4000); return; }
+  abrirModal('Borrar los datos del grupo', '<p>Se borran de la nube el monitoreo, la ubicación, el rastro y el SOS de este grupo. Sirve para empezar de cero entre pruebas.</p>', [
+    { texto: 'Cancelar', clase: 'secondary' },
+    { texto: 'Borrar', clase: 'danger', accion: async () => {
+      try { await Nube.limpiarGrupo(); aviso('Datos del grupo borrados'); }
+      catch (err) { aviso(err && err.estado ? nubeTextoError(err) : 'Primero activa la nube con un código válido', 5000); }
+    } },
+  ]);
+}
+
+/* =========================================================
  * 16. Arranque
  * ========================================================= */
 async function arrancar() {
   await DB.abrir();
-  estado.monitoreo = (await DB.leerAjuste('monitoreo')) || null;
+  estado.monitoreo = normalizarMonitoreo((await DB.leerAjuste('monitoreo')) || null);
   if (!monitoreoActivo()) {
     // Versiones anteriores guardaban la ubicación y la hora límite sin consentimiento
     await DB.guardarAjuste('ultimaUbicacion', null);
@@ -2519,6 +3774,8 @@ async function arrancar() {
   }
   estado.sos = (await DB.leerAjuste('sos')) || null;
   estado.pruebas = !!(await DB.leerAjuste('pruebas'));
+  estado.modoRed = (await DB.leerAjuste('modoRed')) === 'offline' ? 'offline' : 'online';
+  await iniciarNube();
   pintarPerfil();
 
   // Si la app se cerró a media ruta, se recupera como pausada
@@ -2556,6 +3813,7 @@ async function arrancar() {
   if ('serviceWorker' in navigator && !ABIERTA_COMO_ARCHIVO) {
     const habiaControlador = !!navigator.serviceWorker.controller;
     navigator.serviceWorker.register('sw.js').catch((err) => console.warn('Service Worker:', err));
+    avisarModoRedAlSW();
     navigator.serviceWorker.addEventListener('controllerchange', () => {
       if (habiaControlador) aviso('Nueva versión instalada; se usará al volver a abrir la app', 4000);
     });
@@ -2571,11 +3829,13 @@ async function arrancar() {
   }
 
   // Sesión: se recupera la última o se pide usuario y contraseña
-  if (await Sesion.recuperar() && await DB.leerAjuste(`perfil:${Sesion.rol}`)) await entrarComo(Sesion.rol, true);
+  if (await Sesion.recuperar() && Sesion.vista && !(await DB.leerAjuste(Sesion.clavePerfil()))) await Sesion.guardarVista(null);
+  if (Sesion.rol && await DB.leerAjuste(Sesion.clavePerfil())) await entrarComo(Sesion.actual(), true);
   else { await Sesion.cerrar(); await mostrarLogin(); }
 
   // El permiso de ubicación se pide solo al aceptar el monitoreo, iniciar una ruta, o usar SOS o "Enviar mi ubicación"
   pintarHud();
+  prepararAtras();
 }
 
 arrancar();

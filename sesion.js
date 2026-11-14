@@ -6,6 +6,9 @@
  *   exp    Experto: además revisa las rutas y las aprueba o rechaza.
  *   dev    Administrador: todo lo anterior, pruebas y cambio de contraseñas.
  *
+ * Vistas de prueba: dev puede "ver como" scout, jefe o exp sin cerrar sesión.
+ * Sesion.rol sigue siendo 'dev' y Sesion.vista es el rol que se muestra.
+ *
  * IMPORTANTE: la app no tiene servidor. Las contraseñas se guardan cifradas
  * (SHA-256) en este teléfono y sirven para separar las vistas, no para
  * proteger datos de alguien que tenga el teléfono y sepa programar.
@@ -16,7 +19,7 @@ const ROLES = {
   scout: { nombre: 'Scout', icono: '🧒', inicio: 'grabar', color: '#a6e3a1', desc: 'Graba tus rutas y pide ayuda' },
   jefe: { nombre: 'Jefe', icono: '🧭', inicio: 'jefe', color: '#89dceb', desc: 'Está al pendiente del grupo' },
   exp: { nombre: 'Experto', icono: '🎖', inicio: 'revisar', color: '#cba6f7', desc: 'Revisa y certifica rutas' },
-  dev: { nombre: 'Dev', icono: '🛠', inicio: 'grabar', color: '#fab387', desc: 'Pruebas y administración' },
+  dev: { nombre: 'Dev', icono: '🛠', inicio: 'admin', color: '#fab387', desc: 'Pruebas y administración' },
 };
 const CLAVE_PREDETERMINADA = '0000';
 
@@ -36,6 +39,21 @@ async function huellaClave(rol, clave) {
 
 const Sesion = {
   rol: null,
+  vista: null, // solo dev: rol que se muestra en una vista de prueba
+
+  /* Rol con el que se muestra la app (la vista de dev o el rol real) */
+  actual() {
+    return Sesion.vista || Sesion.rol;
+  },
+
+  esDev() {
+    return Sesion.rol === 'dev';
+  },
+
+  /* Perfil del rol; las vistas de prueba usan perfil:prueba-<rol> */
+  clavePerfil(rol = Sesion.actual(), prueba = !!Sesion.vista) {
+    return prueba ? `perfil:prueba-${rol}` : `perfil:${rol}`;
+  },
 
   async claves() {
     return (await DB.leerAjuste('claves')) || {};
@@ -73,28 +91,38 @@ const Sesion = {
 
   async guardar(rol) {
     Sesion.rol = rol;
-    await DB.guardarAjuste('sesion', { rol, t: Date.now() });
+    Sesion.vista = null;
+    await DB.guardarAjuste('sesion', { rol, vista: null, t: Date.now() });
+  },
+
+  async guardarVista(vista) {
+    if (!Sesion.esDev()) return;
+    Sesion.vista = vista && vista !== 'dev' ? vista : null;
+    await DB.guardarAjuste('sesion', { rol: Sesion.rol, vista: Sesion.vista, t: Date.now() });
   },
 
   async recuperar() {
     const s = await DB.leerAjuste('sesion');
     Sesion.rol = s && ROLES[s.rol] ? s.rol : null;
+    Sesion.vista = Sesion.rol === 'dev' && s.vista && ROLES[s.vista] ? s.vista : null;
     return Sesion.rol;
   },
 
   async cerrar() {
     Sesion.rol = null;
+    Sesion.vista = null;
     await DB.guardarAjuste('sesion', null);
   },
 
+  /* Las pestañas y data-roles siguen la vista; los permisos de dev se revisan con esDev() */
   puede(roles) {
-    return !roles || roles.split(/\s+/).includes(Sesion.rol);
+    return !roles || roles.split(/\s+/).includes(Sesion.actual());
   },
 };
 
 /* Muestra u oculta lo que tiene data-roles según el usuario */
 function aplicarPermisos() {
-  const rol = Sesion.rol;
+  const rol = Sesion.actual();
   document.body.classList.toggle('sin-sesion', !rol);
   Object.keys(ROLES).forEach((r) => document.body.classList.toggle(`rol-${r}`, r === rol));
   document.querySelectorAll('[data-roles]').forEach((el) => {
@@ -104,4 +132,8 @@ function aplicarPermisos() {
   document.querySelector('.tabbar').style.setProperty('--pestanas', visibles);
   const info = ROLES[rol];
   document.querySelector('#btn-cuenta').textContent = info ? `${info.icono} ${info.nombre.toUpperCase()}` : '—';
+  // Barra naranja de las vistas de prueba
+  document.body.classList.toggle('viendo-como', !!Sesion.vista);
+  document.querySelector('#barra-vista').hidden = !Sesion.vista;
+  if (Sesion.vista) document.querySelector('#bv-rol').textContent = ROLES[Sesion.vista].nombre;
 }

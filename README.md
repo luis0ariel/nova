@@ -1,17 +1,17 @@
-# ✦ Nova — v2.0.6
+# ✦ Nova — v2.2.0
 
 App web instalable (PWA) para registrar rutas de senderismo con GPS, sin internet. Está hecha con **HTML, CSS y JavaScript** y funciona en el celular. Su tema espacial está basado en StarPaint.
 
 ## Usuarios
 
-Al abrir Nova eliges tu tipo de usuario y escribes tu contraseña en el teclado numérico. La primera vez, cada usuario llena su **perfil de seguridad**.
+Al abrir Nova escribes tu **usuario** (scout, jefe, exp o dev) y tu **contraseña**, y tocas **Entrar**. La primera vez, cada usuario llena su **perfil de seguridad**.
 
 | Usuario | Contraseña inicial | Pestañas |
 | --- | --- | --- |
 | 🧒 `scout` | `0000` | Grabar, Rutas, Perfil |
 | 🧭 `jefe` | `0000` | + Jefe (está al pendiente del grupo) |
 | 🎖 `exp` | `0000` | + Revisar (valida rutas con un recorrido real, o las rechaza con una nota) |
-| 🛠 `dev` | `0000` | Todas + Admin (contraseñas, modo pruebas, borrar datos) |
+| 🛠 `dev` | `0000` | Admin (inicio), Rutas (todas, con filtros) y Perfil. Entra a lo demás con "Ver como". Borra rutas al instante con "Deshacer" |
 
 Cada tipo de usuario tiene su propio color y su propio perfil.
 
@@ -21,18 +21,24 @@ Cada tipo de usuario tiene su propio color y su propio perfil.
 
 | Pestaña | Qué hace |
 | --- | --- |
-| **Grabar** (inicio) | Mapa nocturno con la ruta en dorado; tiempo, distancia, ritmo y descansos; Iniciar, Pausar, Descanso y Terminar; enviar ubicación al jefe; guardar mapa (solo dev). La ubicación y la batería se comparten con el jefe **solo si el scout aceptó el monitoreo** |
+| **Grabar** (inicio) | Mapa nocturno con la ruta en dorado; tiempo, distancia, ritmo y descansos; Iniciar, Pausar, Descanso y Terminar; enviar ubicación al jefe; **📡 Pedir monitoreo** (scout y experto, con motivo y hora límite opcionales); guardar mapa (solo dev). La ubicación y la batería se comparten con el jefe **solo con monitoreo aceptado** |
 | **Rutas** | Lista e importar. Dentro de una ruta: mapa, estadísticas, paradas, **Enviar a validación de experto** (manual; nada se envía solo al terminar), revisión, renombrar, **exportar** (.gpx o .nova.json) y **borrar** |
 | **Perfil** | Nombre, fecha de nacimiento, tipo de sangre, alergias, padecimientos, contacto de emergencia y jefe; cerrar sesión |
 | **Jefe** | **Monitoreo con consentimiento**: "Iniciar monitoreo" (hora límite opcional) manda una solicitud que el scout acepta o rechaza. Activo: estado (en ruta, en descanso, retrasado, SOS), ubicación, batería, ruta, perfil de emergencia y hora límite; "Terminar monitoreo" lo cierra. Historial de quién lo inició, aceptó, rechazó o terminó. Rutas del grupo |
 | **Revisar** | Rutas que los scouts enviaron (`pendiente_revision`) y revisadas. Dentro de una ruta: **recorrido de validación** (el experto la recorre y Nova compara distancia y desnivel; tolerancia 15 %). Si está dentro, se aprueba con fechas de vigencia y observaciones de seguridad y queda `validada` con la firma del experto. También se puede rechazar con nota |
-| **Admin** | Contraseñas, modo pruebas y sistema |
+| **Admin** | Contraseñas, modo pruebas, **modo online/offline** (un botón), **Ver como** Scout / Jefe / Experto (barra naranja "Volver a dev"; lo creado ahí queda como PRUEBA), **Borrar datos de prueba** y sistema |
 
 - **Barra de estado** (arriba, discreta como un contador de FPS): GPS ±metros, internet, batería, mosaicos de mapa guardados y la hora límite que puso el jefe (avisa 15 minutos antes y al vencer). Tócala para ver el detalle.
 - **Mapa bloqueado 🔒** mientras grabas: sigue tu posición y no se arrastra. Toca 🔒 para moverlo libremente, ⤢ para ver toda la ruta y ◎ para centrar.
 - **Borrar ruta:** se borra **1 hora después**. Mientras tanto aparece "Se borrará a las…" con el botón **Cancelar borrado**.
 - **SOS:** el SMS va al contacto de emergencia y al jefe, con tu ubicación, edad, tipo de sangre, alergias y padecimientos. También hay un botón para llamar al 911.
-- **Modo pruebas** (solo `dev`, en Admin): muestra "Simular recorrido" en Grabar y "Repetir como demo" dentro de una ruta.
+- **Nube (Firebase)** (solo `dev`, en Admin → Nube): sincroniza el monitoreo entre teléfonos. El jefe ve en su teléfono la ubicación, la batería, la ruta y el estado (en ruta, en descanso, retrasado) de quien aceptó, y recibe el SOS de otro teléfono con alerta. Todos los teléfonos usan el mismo **código de grupo** (16 o más letras y números); sin ese código no se puede leer nada. Solo se sube lo que el monitoreado aceptó compartir y su SOS; el perfil de salud no se sube. Funciona con la app abierta y la pantalla encendida: al bloquear el celular, Android congela la app. El botón **Probar** revisa la base paso a paso. En modo offline la nube se pausa. Las vistas de prueba de dev no suben ni reciben nada.
+- **Modo online / offline** (solo `dev`, en Admin → Conexión): un botón alterna entre los dos. En **offline** Nova no usa internet: el mapa solo muestra la carpeta `mapas/` y los mosaicos ya guardados, "Guardar mapa" se bloquea y la barra de estado dice MODO OFFLINE. En **online** funciona como siempre. El ajuste se guarda en el teléfono y vale para todos los usuarios.
+- **Punto de inicio de la simulación:** en la ventana de "Simular recorrido" (recorrido inventado) toca **Elegir inicio en el mapa**, mueve el mapa y toca. Si no eliges, arranca en el punto de siempre. "Repetir como demo" empieza donde empieza la ruta.
+- **Modo pruebas** (solo `dev`, en Admin): muestra "Simular recorrido" en Grabar y "Repetir como demo" dentro de una ruta (en las vistas de prueba siempre están). Eliges la duración (hasta 12 h) y la velocidad (1x a 50x); un reloj virtual hace que la ruta guarde el tiempo simulado. Ej.: 2 h a 50x tarda 2.4 min reales.
+- **Salir:** "✕ Salir sin guardar" en Grabar, "✕ Cancelar validación", ✕ en todas las ventanas y el botón atrás del celular.
+- **Barra de estado** solo en Grabar; con monitoreo activo, "📡 MONITOREO" se ve arriba en todas las pestañas.
+- **🛠 Generar recorrido** (dev, en Revisar): crea un recorrido de validación por variación (−50 % a +50 % en distancia y desnivel) o tocando puntos en el mapa, sin caminar.
 
 ## Abrir Nova
 
@@ -79,6 +85,7 @@ Sube el número de `VERSION` en `sw.js` y `VERSION_APP` en `app.js`; si no, el t
 | `index.html` | Pantallas, inicio de sesión y formulario de perfil |
 | `styles.css` | Tema espacial de Nova |
 | `sesion.js` | Usuarios, contraseñas y permisos |
+| `nube.js` | Conexión con Firebase (API REST y tiempo real, sin SDK) |
 | `app.js` | GPS, mapa, registro, perfil, SOS, jefe, revisión, admin |
 | `sw.js` | Service Worker (modo sin internet) |
 | `manifest.json` | Instalación como app |

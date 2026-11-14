@@ -3,12 +3,46 @@
  * - Guarda los mosaicos del mapa que ya viste (y las zonas que guardes), para verlos sin internet.
  * Cambia VERSION cada vez que modifiques archivos de la app.
  */
-const VERSION = 'v2.0.6';
+const VERSION = 'v2.2.0';
 const CACHE_APP = `ruta-segura-app-${VERSION}`;
 const CACHE_MAPA = 'nova-mapa';
 const CACHE_MAPA_VIEJA = 'ruta-segura-mapa'; // tiene mosaicos de CARTO con la marca "API KEY REQUIRED"
 const CACHE_LOCAL = 'ruta-segura-local'; // archivos de la carpeta mapas/ y otros del mismo sitio
 const MAX_MOSAICOS = 6000;
+
+// Modo de conexión: 'online' u 'offline'. Lo cambia dev en Admin y llega por mensaje.
+// Se guarda en caché porque el Service Worker se duerme y pierde la memoria.
+const CACHE_CONFIG = 'nova-config';
+const CLAVE_MODO = 'modo-red';
+// Un servidor local (localhost) no es internet: sus archivos se siguen pidiendo en offline
+const SERVIDOR_LOCAL = ['localhost', '127.0.0.1'].includes(self.location.hostname);
+let modoRed = null;
+
+async function leerModo() {
+  if (modoRed) return modoRed;
+  try {
+    const cache = await caches.open(CACHE_CONFIG);
+    const resp = await cache.match(CLAVE_MODO);
+    modoRed = resp && (await resp.text()) === 'offline' ? 'offline' : 'online';
+  } catch {
+    modoRed = 'online';
+  }
+  return modoRed;
+}
+
+async function guardarModo(modo) {
+  modoRed = modo === 'offline' ? 'offline' : 'online';
+  const cache = await caches.open(CACHE_CONFIG);
+  await cache.put(CLAVE_MODO, new Response(modoRed));
+}
+
+async function redBloqueada() {
+  return !SERVIDOR_LOCAL && (await leerModo()) === 'offline';
+}
+
+self.addEventListener('message', (e) => {
+  if (e.data && e.data.tipo === 'modo-red') e.waitUntil(guardarModo(e.data.modo));
+});
 
 const ARCHIVOS_APP = [
   './',
@@ -16,6 +50,7 @@ const ARCHIVOS_APP = [
   'styles.css',
   'app.js',
   'sesion.js',
+  'nube.js',
   'manifest.json',
   'icons/icon-192.png',
   'icons/icon-512.png',
@@ -61,6 +96,7 @@ async function mosaicoDelMapa(request) {
   const cache = await caches.open(CACHE_MAPA);
   const guardado = await cache.match(request, { ignoreVary: true });
   if (guardado) return guardado;
+  if ((await leerModo()) === 'offline') return new Response('', { status: 504, statusText: 'Modo offline' });
   try {
     const resp = await fetch(request);
     if (resp.ok || resp.type === 'opaque') {
@@ -77,26 +113,29 @@ async function archivoLocal(request) {
   const deLaApp = await caches.match(request, { ignoreSearch: true, cacheName: CACHE_APP });
   if (deLaApp) return deLaApp;
 
-  // Página principal: si no hay red, se entrega index.html guardado
+  // Página principal: si no hay red (o el modo es offline), se entrega index.html guardado
   if (request.mode === 'navigate') {
-    try { return await fetch(request); }
-    catch { return (await caches.match('index.html', { cacheName: CACHE_APP })) || Response.error(); }
+    if (!(await redBloqueada())) {
+      try { return await fetch(request); } catch { /* sin red: se usa index.html guardado */ }
+    }
+    return (await caches.match('index.html', { cacheName: CACHE_APP })) || Response.error();
   }
 
   const cache = await caches.open(CACHE_LOCAL);
-  try {
-    const resp = await fetch(request);
-    if (resp.ok) cache.put(request, resp.clone());
-    return resp;
-  } catch {
-    const guardado = await cache.match(request, { ignoreSearch: true });
-    if (guardado) return guardado;
-    // Los mosaicos de mapas/ que falten se marcan como ausentes para que el mapa pruebe otra fuente
-    if (url.pathname.includes('/mapas/') || url.pathname.endsWith('.png')) {
-      return new Response('', { status: 404 });
-    }
-    return Response.error();
+  if (!(await redBloqueada())) {
+    try {
+      const resp = await fetch(request);
+      if (resp.ok) cache.put(request, resp.clone());
+      return resp;
+    } catch { /* sin internet: se busca en lo guardado */ }
   }
+  const guardado = await cache.match(request, { ignoreSearch: true });
+  if (guardado) return guardado;
+  // Los mosaicos de mapas/ que falten se marcan como ausentes para que el mapa pruebe otra fuente
+  if (url.pathname.includes('/mapas/') || url.pathname.endsWith('.png')) {
+    return new Response('', { status: 404 });
+  }
+  return Response.error();
 }
 
 self.addEventListener('fetch', (e) => {

@@ -195,6 +195,45 @@ h3 { font-size: .85rem; color: var(--tenue); letter-spacing: .1em; text-transfor
 #j-mon-iniciar, #j-mon-terminar { width: 100%; margin: 4px 0 10px; }
 #j-personas:not(:empty) { margin-bottom: 10px; }
 #j-mon-historial, #j-mon-historial ul { list-style: none; margin: 0; padding: 0; }
+#barra-vista {
+  background: var(--naranja); color: var(--oscuro); font-size: .78rem; font-weight: 700;
+  padding: 6px 12px; text-align: center; letter-spacing: .04em;
+}
+#barra-vista button { background: var(--oscuro); color: var(--naranja); border: 0; border-radius: 4px; padding: 3px 8px; font: inherit; margin-left: 4px; }
+body.sin-sesion #barra-vista { display: none; }
+.chip.prueba { color: var(--naranja); border-style: dashed; margin-left: 6px; vertical-align: middle; }
+.solicitud-mon { background: var(--tarjeta); border: 1px solid var(--borde); border-radius: 8px; padding: 4px 12px 12px; margin: 8px 0; }
+#btn-pedir-mon { width: 100%; }
+.controls.tres { display: grid; grid-template-columns: 1fr; gap: 8px; padding: 6px 0 10px; }
+.toast-boton { background: var(--acento); color: var(--oscuro); border: 0; border-radius: 4px; padding: 4px 10px; font: inherit; font-weight: 700; margin-left: 8px; }
+.gen-pestanas { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px; }
+.gen-pestanas button { background: var(--tarjeta); color: var(--tenue); border: 1px solid var(--borde); border-radius: 6px; padding: 7px; font: inherit; font-size: .8rem; }
+.gen-pestanas button.activa { border-color: var(--acento); color: var(--acento); }
+#gen-mapa { height: 220px; border-radius: 8px; border: 1px solid var(--borde); margin-bottom: 8px; background: #0a0a12; }
+.gen-control { display: block; font-size: .8rem; margin: 6px 0; }
+.gen-control input { width: 100%; accent-color: var(--acento); }
+#gen-generar { width: 100%; margin: 8px 0 4px; }
+.gen-punto { background: var(--naranja); color: var(--oscuro); border-radius: 50%; font-weight: 700; font-size: .72rem; display: flex; align-items: center; justify-content: center; border: 2px solid #fff; }
+/* Barra de estado solo en Grabar; el monitoreo va en la barra superior */
+body:not(.tab-grabar) #hud { display: none; }
+#h-monitoreo { margin-left: auto; color: var(--verde); font-size: .66rem; font-weight: 700; letter-spacing: .06em; white-space: nowrap; }
+#h-monitoreo:not([hidden]) + .usuario-btn { margin-left: 0; }
+/* Las vistas de prueba no mandan ubicación al jefe real */
+body.viendo-como [data-action="enviar-ubicacion"] { display: none; }
+#barra-validacion { background: rgba(137, 220, 235, .1); color: var(--cian); border-bottom: 1px solid var(--cian); padding: 7px 12px; font-size: .78rem; }
+#barra-validacion button { background: transparent; color: var(--rojo); border: 1px solid var(--rojo); border-radius: 4px; padding: 2px 8px; font: inherit; margin-left: 4px; }
+#btn-descartar { display: block; margin: 8px auto 0; }
+#btn-descartar[hidden] { display: none; }
+#sim-control { padding: 6px 14px 0; }
+#sim-control[hidden] { display: none; }
+.m-cerrar { position: absolute; top: -8px; right: -8px; background: transparent; border: 0; color: var(--apagado); font-size: 1.1rem; padding: 4px 8px; }
+.m-cerrar:hover { color: var(--texto); }
+#modal > form { position: relative; }
+dialog h2 { padding-right: 28px; }
+#m-botones.tres { grid-template-columns: 1fr; }
+.filtros { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 10px; }
+.filtros button { background: var(--tarjeta); color: var(--tenue); border: 1px solid var(--borde); border-radius: 999px; padding: 5px 12px; font: inherit; font-size: .75rem; }
+.filtros button.activa { border-color: var(--acento); color: var(--acento); }
 .evento-mon { border-left: 2px solid var(--borde); padding: 2px 0 2px 10px; margin: 6px 0; font-size: .78rem; }
 .evento-mon li { padding: 2px 0; }
 #d-enviar { width: 100%; margin-top: 14px; }
@@ -297,32 +336,10 @@ body.sin-sesion .topbar, body.sin-sesion .hud, body.sin-sesion main, body.sin-se
 .paso { animation: aparecer .25s ease-out; }
 @keyframes aparecer { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
-.roles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.rol-tarjeta {
-  --c: var(--oro);
-  background: var(--tarjeta); border: 1px solid var(--c); border-radius: 10px; padding: 0; overflow: hidden;
-  color: var(--texto); text-align: left; transition: transform .12s, box-shadow .12s;
-}
-.rol-tarjeta:hover, .rol-tarjeta:focus-visible { transform: translateY(-2px); box-shadow: 0 0 16px color-mix(in srgb, var(--c) 35%, transparent); outline: none; }
-.rol-tarjeta .cara { display: block; padding: 14px 12px 10px; background: linear-gradient(180deg, #0f0f20 0%, color-mix(in srgb, var(--c) 10%, #13132a) 100%); }
-.rol-tarjeta .icono { font-size: 1.9rem; display: block; }
-.rol-tarjeta .nombre { display: block; color: var(--c); font-weight: 700; letter-spacing: .1em; margin-top: 6px; }
-.rol-tarjeta .desc { display: block; color: var(--apagado); font-size: .68rem; margin-top: 3px; line-height: 1.35; }
-.rol-tarjeta .pie { display: flex; justify-content: space-between; padding: 6px 12px; background: #08080f; font-size: .64rem; color: var(--oculto); }
-.rol-tarjeta .pie b { color: var(--c); }
 
-.rol-elegido { display: inline-flex; align-items: center; gap: 8px; color: var(--acento); font-weight: 700; letter-spacing: .12em; margin: 8px 0 4px; }
-.rol-elegido .icono { font-size: 1.6rem; }
-.pin { display: flex; justify-content: center; gap: 12px; margin: 14px 0 6px; min-height: 18px; }
-.pin i { width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--acento); }
-.pin i.lleno { background: var(--acento); box-shadow: 0 0 8px var(--acento); }
-.teclado { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 14px auto 12px; max-width: 290px; }
-.teclado button {
-  height: 58px; border-radius: 10px; background: var(--panel); color: var(--texto); border: 1px solid var(--borde);
-  font-size: 1.35rem; font-weight: 700;
-}
-.teclado button:active { background: var(--hover); border-color: var(--acento); }
-.teclado .ok { background: var(--acento); color: var(--oscuro); border: 0; }
+.form-login { text-align: left; max-width: 340px; margin: 18px auto 0; display: grid; gap: 12px; }
+.form-login .campo { display: grid; gap: 6px; color: var(--tenue); font-size: .8rem; letter-spacing: .08em; }
+.form-login button { margin-top: 4px; }
 .login-error { color: var(--rojo); font-weight: 700; margin: 6px 0 0; font-size: .85rem; }
 .login-pie { margin-top: 18px; }
 #paso-registro { text-align: left; }
@@ -338,8 +355,7 @@ body:not(.pruebas) .solo-pruebas { display: none !important; }
 
 @media (max-width: 380px) {
   .stats { grid-template-columns: repeat(2, 1fr); }
-  .roles { gap: 8px; }
-}
+  }
 @media (min-width: 700px) {
   #mapa { height: 56vh; }
 }
